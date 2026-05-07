@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import datetime
 
+from core.identity import same_incident
+
 
 @dataclass
 class IncidentMemory:
@@ -35,11 +37,11 @@ class IncidentGraph:
         self.incidents.append(incident)
 
     def find_similar(self, signature: str, threshold: float = 0.6) -> List[IncidentMemory]:
-        # Very lightweight similarity: substring match on signatures or service
-        sig = signature.lower()
+        # Normalize identity matching through the shared core helper
+        query = {"signature": signature}
         out = []
         for inc in self.incidents:
-            if sig in inc.error_signature.lower() or sig in inc.service.lower():
+            if same_incident(query, {"signature": inc.error_signature, "service": inc.service}):
                 out.append(inc)
         return out
 

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 from config import get_config
+from core.scoring import severity_emoji
 
 logger = logging.getLogger(__name__)
 
@@ -166,19 +167,14 @@ class SlackClient:
         error_count: int = 1,
     ) -> List[Dict[str, Any]]:
         """Build Slack Block Kit message."""
-        severity_emoji = {
-            "S1": ":red_circle:",
-            "S2": ":large_orange_circle:",
-            "S3": ":large_yellow_circle:",
-            "S4": ":large_blue_circle:",
-        }.get(severity, ":white_circle:")
+        severity_icon = severity_emoji(severity)
         
         blocks = [
             {
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"{severity_emoji} {severity}: {signature[:60]}",
+                    "text": f"{severity_icon} {severity}: {signature[:60]}",
                     "emoji": True,
                 }
             },

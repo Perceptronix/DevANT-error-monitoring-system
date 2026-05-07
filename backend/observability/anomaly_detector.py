@@ -1,5 +1,7 @@
 from typing import List, Dict, Any
 
+from ontology import MetricAnomaly
+
 
 class AnomalyDetector:
     """Detect metric anomalies and correlate with deployments.
@@ -22,5 +24,19 @@ class AnomalyDetector:
         spikes = []
         for s in series:
             if s.get("value", 0) > avg * factor:
-                spikes.append({"time": s.get("time"), "value": s.get("value")})
+                anomaly = MetricAnomaly(
+                    source_of_truth="metric_series",
+                    timestamp=s.get("time") if isinstance(s.get("time"), str) else s.get("time"),
+                    confidence_origin="spike_detector",
+                    evidence_origin=["metric_series"],
+                    anomaly_id=f"{s.get('time')}-{s.get('value')}",
+                    metric_name=s.get("metric", "unknown"),
+                    value=float(s.get("value", 0)),
+                    baseline=float(avg),
+                    deviation=float(s.get("value", 0) - avg),
+                    direction="up",
+                    window_minutes=5,
+                    service=s.get("service"),
+                )
+                spikes.append(anomaly.model_dump())
         return spikes

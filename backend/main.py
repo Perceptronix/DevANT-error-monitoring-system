@@ -31,6 +31,7 @@ from state import get_state_manager
 from sources import get_data_source, get_available_sources
 from samples import get_sample_errors
 from pipeline import ErrorClusterer, ContextSearcher, ErrorAnalyzer, get_action_executor
+from core.scoring import severity_priority
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -327,7 +328,7 @@ def _generate_actionable_title(analysis: Dict[str, Any]) -> str:
 
 def _generate_slack_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a Slack message preview."""
-    severity_emoji = {
+    severity_icon = {
         "S1": "🔴",
         "S2": "🟠", 
         "S3": "🟡",
@@ -340,7 +341,7 @@ def _generate_slack_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
         "blocks": [
             {
                 "type": "header",
-                "text": f"{severity_emoji.get(analysis['severity'], '⚪')} {analysis['severity']}: {title}"
+                "text": f"{severity_icon.get(analysis['severity'], '⚪')} {analysis['severity']}: {title}"
             },
             {
                 "type": "section",
@@ -370,7 +371,7 @@ def _generate_linear_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
 ## Suggested Action
 {analysis.get('suggested_action', 'Investigate and resolve')}
 """,
-        "priority": {"S1": 1, "S2": 2, "S3": 3, "S4": 4}.get(analysis["severity"], 3),
+        "priority": severity_priority(analysis["severity"]),
         "labels": ["bug", "monitoring", analysis["severity"].lower()]
     }
 

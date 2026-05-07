@@ -9,6 +9,7 @@ from observability.service_map import owners_for_service
 from observability.rollback_engine import RollbackEngine
 from .reranker import RetrievalReranker
 from .evidence_builder import EvidenceBuilder
+from core.scoring import combine_evidence_score
 
 
 class HybridRetriever:
@@ -84,7 +85,7 @@ class HybridRetriever:
                 e["stacktrace_score"] = 0.0
 
         # Deployment correlation (temporal/nearby events)
-        correlation = await self.deployment.correlate(incident)
+        correlation = self.deployment.correlate(incident)
 
         # Fetch deployments for the repo (if provided) to include in evidence
         deployments = []
@@ -114,13 +115,14 @@ class HybridRetriever:
 
             # deployment score: use correlator score if present
             deployment_score = correlation.get("score", 0.0)
+            owner_match = e.get("metadata", {}).get("owner") == owner
 
-            final_base = (
-                semantic * 0.35 +
-                stack * 0.30 +
-                deployment_score * 0.15 +
-                keyword_score * 0.10 +
-                (0.1 if (e.get("metadata", {}).get("owner") == owner) else 0.0)
+            final_base = combine_evidence_score(
+                semantic_score=semantic,
+                stacktrace_score=stack,
+                deployment_score=deployment_score,
+                keyword_score=keyword_score,
+                owner_match=owner_match,
             )
 
             # boost if evidence directly references a deployment/commit matching incident
@@ -134,7 +136,7 @@ class HybridRetriever:
             except Exception:
                 commit_match_bonus = 0.0
 
-            e["base_score"] = final_base + commit_match_bonus
+            e["base_score"] = final_base
             e["deployment_correlation"] = bool(commit_match_bonus)
 
         # Rerank with additional heuristics

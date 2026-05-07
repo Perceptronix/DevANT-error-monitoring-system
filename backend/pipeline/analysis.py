@@ -14,6 +14,11 @@ from typing import List, Dict, Any, Optional, Literal
 
 from pydantic import BaseModel, Field
 
+from core.causality import correlate_deployment_events
+from core.scoring import infer_severity
+from ontology.models import Incident, RCAHypothesis
+from observability.propagation_engine import PropagationEngine
+from memory.causal_graph import CausalGraph
 from schemas import PreviousErrorState
 from state import get_state_manager
 from memory.hybrid_search import HybridRetriever
@@ -73,6 +78,8 @@ class ErrorAnalyzer:
     def __init__(self):
         self.last_reasoning: Optional[str] = None
         self.state = get_state_manager()
+        self.propagation_engine = PropagationEngine()
+        self.causal_graph = CausalGraph()
         self._init_llm()
         # Hybrid retriever for grounded operational evidence
         try:
@@ -141,17 +148,16 @@ class ErrorAnalyzer:
             except Exception as e:
                 logger.warning(f"Hybrid retrieval failed for {signature[:40]}: {e}")
 
-            # If hybrid retrieval failed, fall back to legacy context mapping
-            context = (evidence_bundle or {}).get("evidences") if evidence_bundle else None
+            operational_context = self.build_operational_context(cluster, evidence_bundle or {})
 
             if self.llm:
                 try:
-                    analysis = await self._llm_analyze(cluster, evidence_bundle or {})
+                    analysis = await self._llm_analyze(cluster, evidence_bundle or {}, operational_context)
                 except Exception as e:
                     logger.error(f"LLM analysis failed: {e}", exc_info=True)
-                    analysis = self._fallback_analysis(cluster, evidence_bundle or {})
+                    analysis = self._fallback_analysis(cluster, evidence_bundle or {}, operational_context)
             else:
-                analysis = self._fallback_analysis(cluster, evidence_bundle or {})
+                analysis = self._fallback_analysis(cluster, evidence_bundle or {}, operational_context)
             
             analyses.append(analysis)
             if analysis.get("reasoning"):
@@ -159,11 +165,166 @@ class ErrorAnalyzer:
         
         self.last_reasoning = "\n\n".join(all_reasoning)
         return analyses
+
+    async def analyze(
+        self,
+        errors: List[Dict[str, Any]],
+        cluster_signature: str,
+    ) -> ErrorAnalysis:
+        """Compatibility wrapper returning the historical ErrorAnalysis model."""
+        cluster = {
+            "signature": cluster_signature,
+            "error_count": len(errors),
+            "affected_orgs": sorted({error.get("org_name") for error in errors if error.get("org_name")}),
+            "modules": sorted({error.get("module") for error in errors if error.get("module")}),
+        }
+        analysis = self._fallback_analysis(cluster, {})
+        operational_context = self.build_operational_context(cluster, {
+            "deployment_correlation": correlate_deployment_events(cluster),
+            "metrics_anomalies": self._extract_metrics_anomalies(cluster),
+        })
+        analysis = self._fallback_analysis(cluster, {}, operational_context)
+        confidence = min(0.95, 0.35 + (0.05 * min(len(errors), 10)))
+        return ErrorAnalysis(
+            severity=analysis["severity"],
+            title=analysis["title"],
+            root_cause=analysis["root_cause"],
+            impact=analysis["impact"],
+            suggested_action=analysis["suggested_action"],
+            reasoning=analysis["reasoning"],
+            confidence=confidence,
+            evidence_count=len(errors),
+            deployment_correlation=False,
+            historical_match=False,
+        )
+
+    def build_operational_context(
+        self,
+        cluster: Dict[str, Any],
+        evidence_bundle: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build a timeline-grounded causal context for RCA."""
+        incident = self._build_incident_model(cluster, evidence_bundle)
+        deployment_correlation = evidence_bundle.get("deployment_correlation") or correlate_deployment_events(cluster)
+        metrics_anomalies = evidence_bundle.get("metrics_anomalies") or self._extract_metrics_anomalies(cluster)
+        regression_history = evidence_bundle.get("history") or evidence_bundle.get("regression_history") or []
+
+        propagation = self.propagation_engine.infer(
+            incident=incident.model_dump(),
+            deployment_correlation=deployment_correlation,
+            metrics_anomalies=metrics_anomalies,
+            regression_history=regression_history,
+        )
+
+        causal_graph = self.causal_graph.build_from_incident(
+            incident=incident.model_dump(),
+            propagation_chain=propagation.get("propagation_chain", []),
+            deployment_correlation=deployment_correlation,
+            metrics_anomalies=metrics_anomalies,
+            regression_history=regression_history,
+        )
+
+        return {
+            "incident": incident.model_dump(),
+            "deployment_correlation": deployment_correlation,
+            "metrics_anomalies": metrics_anomalies,
+            "regression_history": regression_history,
+            "propagation": propagation,
+            "causal_graph": causal_graph.summary(),
+            "timeline": causal_graph.timeline(),
+            "causal_hypothesis": propagation.get("hypothesis"),
+            "evidence_count": len(evidence_bundle.get("evidences", [])) if isinstance(evidence_bundle, dict) else 0,
+        }
+
+    def _build_incident_model(self, cluster: Dict[str, Any], evidence_bundle: Dict[str, Any]) -> Incident:
+        timestamps = []
+        for error in cluster.get("errors", []):
+            ts = error.get("timestamp") or error.get("occurred_at")
+            if ts:
+                timestamps.append(ts)
+
+        timestamp = timestamps[0] if timestamps else cluster.get("timestamp") or datetime.utcnow().isoformat()
+        signature = cluster.get("signature", "Unknown")
+
+        evidence_origin = []
+        for evidence in (evidence_bundle.get("evidences", []) if isinstance(evidence_bundle, dict) else []):
+            evidence_origin.append(
+                evidence.get("url")
+                or evidence.get("metadata", {}).get("url")
+                or evidence.get("title")
+                or evidence.get("metadata", {}).get("title")
+                or "evidence"
+            )
+
+        return Incident(
+            source_of_truth=evidence_bundle.get("source_of_truth", "pipeline.analysis"),
+            timestamp=datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")) if isinstance(timestamp, str) else timestamp,
+            confidence_origin=evidence_bundle.get("confidence_origin", "causal_grounding"),
+            evidence_origin=evidence_origin,
+            persistence_rules={
+                "retention": "indefinite",
+                "mutability": "append-only",
+                "rewrite_policy": "source-driven",
+            },
+            incident_id=cluster.get("incident_id") or f"incident:{signature[:80]}",
+            signature=signature,
+            service=cluster.get("service") or (cluster.get("modules") or ["unknown"])[0],
+            severity=cluster.get("severity"),
+            summary=cluster.get("summary") or cluster.get("sample_message") or signature,
+            root_cause=cluster.get("root_cause"),
+            deployment_id=cluster.get("deployment_id"),
+            commit_hash=cluster.get("commit_hash"),
+            owner=cluster.get("owner"),
+            affected_orgs=cluster.get("affected_orgs", []),
+        )
+
+    def _extract_metrics_anomalies(self, cluster: Dict[str, Any]) -> List[Dict[str, Any]]:
+        anomalies: List[Dict[str, Any]] = []
+        message = str(cluster.get("sample_message") or cluster.get("signature") or "").lower()
+        tokens = [message]
+        for error in cluster.get("errors", []):
+            tokens.append(str(error.get("message", "")).lower())
+
+        if any(word in " ".join(tokens) for word in ["latency", "slow", "response time", "p95", "p99"]):
+            anomalies.append({
+                "metric_name": "latency_ms",
+                "direction": "up",
+                "value": cluster.get("latency_ms", 0),
+                "baseline": cluster.get("baseline_latency_ms", 0),
+                "deviation": cluster.get("latency_deviation", 0.0),
+                "window_minutes": 15,
+                "service": cluster.get("service") or (cluster.get("modules") or [None])[0],
+            })
+
+        if any(word in " ".join(tokens) for word in ["retry", "backoff", "storm", "throttle"]):
+            anomalies.append({
+                "metric_name": "retry_count",
+                "direction": "up",
+                "value": cluster.get("retry_count", 0),
+                "baseline": cluster.get("baseline_retry_count", 0),
+                "deviation": cluster.get("retry_deviation", 0.0),
+                "window_minutes": 15,
+                "service": cluster.get("service") or (cluster.get("modules") or [None])[0],
+            })
+
+        if any(word in " ".join(tokens) for word in ["saturation", "exhaust", "pool", "oom", "memory", "timeout"]):
+            anomalies.append({
+                "metric_name": "resource_saturation",
+                "direction": "up",
+                "value": cluster.get("saturation", 0),
+                "baseline": cluster.get("baseline_saturation", 0),
+                "deviation": cluster.get("saturation_deviation", 0.0),
+                "window_minutes": 15,
+                "service": cluster.get("service") or (cluster.get("modules") or [None])[0],
+            })
+
+        return anomalies
     
     async def _llm_analyze(
-        self, 
-        cluster: Dict[str, Any], 
-        context: Dict[str, Any]
+        self,
+        cluster: Dict[str, Any],
+        context: Dict[str, Any],
+        operational_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Use LLM to analyze the error cluster."""
         from langchain_core.prompts import ChatPromptTemplate
@@ -206,6 +367,39 @@ class ErrorAnalyzer:
                 for ticket in context["related_tickets"][:2]:
                     context_parts.append(f"- {ticket.get('title', 'Ticket')}: {ticket.get('content', '')[:200]}")
 
+        if operational_context:
+            context_parts.append("\n**Timeline-Grounded Causality:**")
+            incident = operational_context.get("incident", {})
+            context_parts.append(f"- Incident: {incident.get('summary', 'Unknown')} @ {incident.get('timestamp', 'unknown')}")
+
+            deployment = operational_context.get("deployment_correlation", {})
+            context_parts.append(
+                f"- Deployment correlation: matched={deployment.get('matched', False)} score={deployment.get('score', 0):.2f}"
+            )
+
+            anomalies = operational_context.get("metrics_anomalies", [])
+            for idx, anomaly in enumerate(anomalies[:4]):
+                context_parts.append(
+                    f"- anomaly[{idx}]: {anomaly.get('metric_name')} {anomaly.get('direction')} value={anomaly.get('value')} baseline={anomaly.get('baseline')}"
+                )
+
+            propagation = operational_context.get("propagation", {})
+            chain = propagation.get("propagation_chain", [])
+            for idx, event in enumerate(chain[:6]):
+                context_parts.append(
+                    f"- chain[{idx}]: {event.get('phase')} -> {event.get('description')} @ {event.get('timestamp')}"
+                )
+
+            hypothesis = operational_context.get("causal_hypothesis", {})
+            if hypothesis:
+                context_parts.append(
+                    f"- hypothesis: {hypothesis.get('hypothesis', 'Unknown')} likelihood={hypothesis.get('likelihood', 0):.2f}"
+                )
+
+            regression_history = operational_context.get("regression_history", [])
+            if regression_history:
+                context_parts.append(f"- regression_history: {len(regression_history)} prior incident(s)")
+
         context_str = "\n".join(context_parts) if context_parts else "No additional context available."
         
         prompt = ChatPromptTemplate.from_messages([
@@ -214,7 +408,8 @@ class ErrorAnalyzer:
     MANDATES:
     - Do NOT invent deployments, commits, owners, metrics, or historical incidents.
     - Only use the provided, retrieved evidence and structured incident data.
-    - Every factual claim MUST reference evidence by index, URL, or field from the evidence bundle.
+    - Root cause must be grounded in timeline evidence, propagation order, deployment correlation, metrics anomalies, or regression history.
+    - Every factual claim MUST reference evidence by index, URL, or field from the evidence bundle or causal timeline.
     - If evidence is insufficient, respond with "Insufficient evidence" rather than guessing.
 
     Severity Guidelines (be conservative - most errors should be S3 or S4):
@@ -229,7 +424,7 @@ class ErrorAnalyzer:
 
     Output Requirements:
     - Provide a JSON object matching the required schema including `confidence`, `evidence_count`, `deployment_correlation`, and `historical_match`.
-    - Include a brief `reasoning` field that cites evidence items (e.g., "evidence[0].url", "deployment_events[1]").
+    - Include a brief `reasoning` field that cites evidence items and causal timeline entries (e.g., "evidence[0].url", "timeline[2]", "propagation[1]").
 
     {format_instructions}"""),
             ("user", """Analyze this error cluster:
@@ -274,81 +469,86 @@ class ErrorAnalyzer:
             "error_count": cluster.get("error_count", 1),
             "affected_orgs": cluster.get("affected_orgs", []),
             "modules": cluster.get("modules", []),
+            "deployment_correlation": operational_context.get("deployment_correlation", {}),
+            "metrics_anomalies": operational_context.get("metrics_anomalies", []),
+            "regression_history": operational_context.get("regression_history", []),
+            "propagation_chain": operational_context.get("propagation", {}).get("propagation_chain", []),
+            "causal_graph": operational_context.get("causal_graph", {}),
         }
     
     def _fallback_analysis(
         self, 
         cluster: Dict[str, Any], 
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        operational_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fallback analysis without LLM."""
-        signature = cluster.get("signature", "").lower()
+        signature = cluster.get("signature", "")
         error_count = cluster.get("error_count", 1)
         affected_orgs = cluster.get("affected_orgs", [])
         modules = cluster.get("modules", [])
+        operational_context = operational_context or self.build_operational_context(cluster, context)
+        propagation = operational_context.get("propagation", {})
+        deployment_correlation = operational_context.get("deployment_correlation", {})
+        metrics_anomalies = operational_context.get("metrics_anomalies", [])
+        regression_history = operational_context.get("regression_history", [])
+
+        severity_data = infer_severity(
+            signature=signature,
+            error_count=error_count,
+            affected_orgs=affected_orgs,
+            modules=modules,
+        )
+
+        final_state = propagation.get("final_state")
+        if final_state == "outage":
+            severity_data["severity"] = "S1"
+            severity_data["title"] = propagation.get("summary", "Propagation caused service outage")
+        elif final_state in {"timeout", "saturation"} and severity_data["severity"] in {"S3", "S4"}:
+            severity_data["severity"] = "S2"
+            severity_data["title"] = propagation.get("summary", "Propagation caused downstream degradation")
+        elif deployment_correlation.get("matched") and severity_data["severity"] == "S4":
+            severity_data["severity"] = "S3"
         
-        # Determine severity and generate title based on heuristics
-        if any(word in signature for word in ["500", "502", "503", "outage", "down"]):
-            severity = "S2"
-            title = "Service errors indicating degradation"
-            root_cause = "Server error indicating service degradation"
-        elif any(word in signature for word in ["401", "403", "auth", "unauthorized"]):
-            severity = "S3"
-            if "oauth" in signature or "token" in signature or "refresh" in signature:
-                title = "OAuth tokens expired - users need to reconnect"
-            else:
-                title = "Authentication failures with external service"
-            root_cause = "Authentication or authorization failure"
-        elif any(word in signature for word in ["429", "rate limit", "throttl"]):
-            severity = "S3"
-            if "google" in signature or "drive" in signature:
-                title = "Google Drive API rate limits exceeded"
-            elif "dropbox" in signature:
-                title = "Dropbox API rate limits exceeded"
-            elif "slack" in signature:
-                title = "Slack API rate limits exceeded"
-            else:
-                title = "External API rate limiting errors"
-            root_cause = "Rate limiting from external service"
-        elif any(word in signature for word in ["timeout", "connection"]):
-            severity = "S3" if error_count > 5 else "S4"
-            if "database" in signature or "postgres" in signature or "pool" in signature:
-                title = "Database connection issues"
-            else:
-                title = "Network connectivity issues"
-            root_cause = "Network or connection issues"
-        elif any(word in signature for word in ["pool", "exhaust"]):
-            severity = "S3"
-            title = "Database connection pool exhausted"
-            root_cause = "Connection pool exhausted under load"
-        elif any(word in signature for word in ["memory", "oom"]):
-            severity = "S2"
-            title = "Worker memory limit exceeded"
-            root_cause = "Out of memory during processing"
-        elif any(word in signature for word in ["pdf", "corrupt", "parse"]):
-            severity = "S4"
-            title = "Document processing failures"
-            root_cause = "Unable to process corrupted or malformed files"
+        root_cause = severity_data["root_cause"]
+        if deployment_correlation.get("matched"):
+            root_cause = "Recent deployment correlated with the first causal event"
+        elif propagation.get("hypothesis", {}).get("hypothesis"):
+            root_cause = propagation["hypothesis"]["hypothesis"]
+
+        timeline_bits = []
+        for idx, event in enumerate(propagation.get("propagation_chain", [])[:5]):
+            timeline_bits.append(f"{idx + 1}. {event.get('phase')} ({event.get('description')})")
+
+        if metrics_anomalies:
+            metric_summary = ", ".join(a.get("metric_name", "metric") for a in metrics_anomalies[:3])
         else:
-            severity = "S4"
-            title = f"Errors in {modules[0] if modules else 'application'}"
-            root_cause = "Unknown error - requires investigation"
-        
-        # Bump severity if many orgs affected
-        if len(affected_orgs) > 3 and severity in ["S3", "S4"]:
-            severity = "S2" if severity == "S3" else "S3"
-        
+            metric_summary = "no explicit metric anomaly recorded"
+
         return {
-            "signature": cluster.get("signature", ""),
-            "severity": severity,
-            "title": title,
+            "signature": signature,
+            "severity": severity_data["severity"],
+            "title": severity_data["title"],
             "root_cause": root_cause,
-            "impact": f"Affecting {len(affected_orgs)} organization(s): {', '.join(affected_orgs[:3])}",
-            "suggested_action": "Investigate error logs and implement appropriate fix",
-            "reasoning": f"Fallback analysis based on error patterns. Error count: {error_count}, Orgs: {len(affected_orgs)}",
+            "impact": (
+                f"Affecting {len(affected_orgs)} organization(s): {', '.join(affected_orgs[:3])}. "
+                f"Metrics anomalies: {metric_summary}."
+            ),
+            "suggested_action": propagation.get("recommended_action") or "Investigate the earliest causal event and validate deployment impact",
+            "reasoning": (
+                "Timeline-grounded analysis. "
+                f"Deployment matched={deployment_correlation.get('matched', False)} score={deployment_correlation.get('score', 0):.2f}. "
+                f"Propagation final_state={final_state or 'unknown'}. "
+                + (" -> ".join(timeline_bits) if timeline_bits else "No propagation chain inferred.")
+            ),
             "error_count": error_count,
             "affected_orgs": affected_orgs,
             "modules": modules,
+            "deployment_correlation": deployment_correlation,
+            "metrics_anomalies": metrics_anomalies,
+            "regression_history": regression_history,
+            "propagation_chain": propagation.get("propagation_chain", []),
+            "causal_graph": operational_context.get("causal_graph", {}),
         }
     
     # =========================================================================

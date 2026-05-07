@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from schemas import AnalyzedError, ErrorResult, LinearTicketResult, SlackMessageResult
 from state import get_state_manager
 from clients import get_linear_client, get_slack_client
+from core.scoring import severity_priority
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ class ActionExecutor:
             ticket = await self.linear.create_issue(
                 title=f"[{error.severity}] {signature[:80]}",
                 description=self._build_ticket_description(error),
-                priority={"S1": 1, "S2": 2, "S3": 3, "S4": 4}.get(error.severity, 3),
+                priority=severity_priority(error.severity),
                 labels=["bug", "monitoring", error.severity.lower()],
             )
             

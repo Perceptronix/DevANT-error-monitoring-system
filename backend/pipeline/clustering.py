@@ -11,11 +11,14 @@ semantically similar errors that strict matching would miss.
 """
 import os
 import re
+import asyncio
 import logging
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
 from pydantic import BaseModel, Field
+
+from core.identity import incident_identity
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,8 @@ class ErrorClusterer:
         if not errors:
             return []
         
+        await asyncio.sleep(0.001)
+
         if len(errors) == 1:
             cluster = self._create_cluster([errors[0]])
             self.last_reasoning = "Single error - no clustering needed"
@@ -517,6 +522,7 @@ Good examples:
         primary = errors[0]
         
         return {
+            "id": incident_identity(primary),
             "signature": signature,
             "error_count": len(errors),
             "errors": errors,

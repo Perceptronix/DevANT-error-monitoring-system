@@ -1,5 +1,7 @@
 from typing import List, Dict, Any
 
+from core.confidence import derive_evidence_confidence
+
 
 class EvidenceBuilder:
     """Assemble retrieved pieces into a grounded evidence bundle."""
@@ -32,17 +34,18 @@ class EvidenceBuilder:
         """
         evidence_count = len(evidences)
         deployment_corr = bool(correlation.get("matched"))
-
-        # Simple confidence heuristic: combine highest final_score and deployment match
         top_score = max((e.get("final_score", 0) for e in evidences), default=0)
-        # Incorporate historical and ownership signals if present
-        ownership_bonus = 0.1 if ownership else 0.0
-        rollback_bonus = 0.05 if rollback_candidates else 0.0
-        anomalies_bonus = 0.1 if metrics_anomalies else 0.0
 
-        confidence = min(
-            0.999,
-            float(top_score * 0.6 + (0.25 if deployment_corr else 0.0) + ownership_bonus + rollback_bonus + anomalies_bonus),
+        confidence = derive_evidence_confidence(
+            top_score=top_score,
+            deployment_correlated=deployment_corr,
+            ownership=bool(ownership),
+            rollback=bool(rollback_candidates),
+            anomalies=bool(metrics_anomalies),
+            evidences=evidences,
+            correlation=correlation,
+            history=history,
+            retrieval_overlap=None,
         )
 
         bundle = {
@@ -58,7 +61,46 @@ class EvidenceBuilder:
                 "confidence": confidence,
                 "evidence_count": evidence_count,
                 "deployment_correlated": deployment_corr,
+                "confidence_origin": "core.confidence.derive_evidence_confidence",
             }
         }
 
         return bundle
+
+    def build_bundle(
+        self,
+        errors: List[Dict[str, Any]],
+        clusters: List[Dict[str, Any]],
+        search_results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compatibility wrapper used by the older pipeline tests."""
+        evidence_items = []
+
+        for error in errors:
+            evidence_items.append({
+                "error_id": error.get("id") or error.get("error_id"),
+                "source": error.get("source") or error.get("source_type", "unknown"),
+                "title": error.get("message", "Unknown error")[:120],
+                "content": error.get("message", ""),
+                "module": error.get("module"),
+                "timestamp": error.get("timestamp"),
+            })
+
+        for result in search_results:
+            evidence_items.append({
+                "source": result.get("source") or result.get("metadata", {}).get("source", "search"),
+                "title": result.get("title") or result.get("metadata", {}).get("title", "Search result"),
+                "content": result.get("content", ""),
+                "url": result.get("url") or result.get("metadata", {}).get("url"),
+            })
+
+        summary = {
+            "error_count": len(errors),
+            "cluster_count": len(clusters),
+            "search_result_count": len(search_results),
+        }
+
+        return {
+            "evidence_items": evidence_items,
+            "summary": summary,
+        }

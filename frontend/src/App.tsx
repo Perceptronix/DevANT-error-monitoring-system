@@ -44,8 +44,11 @@ function App() {
   const [config, setConfig] = useState<Config | null>(null)
   const [isLoading, setIsLoading] = useState(false)
 
-  // WebSocket connection
-  const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/pipeline`
+  // Use a direct backend socket in local dev so the browser does not depend on the Vite ws proxy.
+  const wsUrl =
+    window.location.hostname === 'localhost' && window.location.port === '3000'
+      ? 'ws://localhost:8000/ws/pipeline'
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/pipeline`
   
   const { isConnected, send } = useWebSocket(wsUrl, {
     onMessage: (message) => {

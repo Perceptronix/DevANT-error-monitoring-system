@@ -1,6 +1,8 @@
 import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+from core.causality import correlate_deployment_events
 from .github_actions import GitHubActionsIngest
 
 
@@ -19,24 +21,27 @@ class DeploymentTracker:
         # Normalize to deployment event format
         events = []
         for r in runs:
+            data = r.model_dump() if hasattr(r, "model_dump") else dict(r)
             events.append({
                 "provider": "github_actions",
-                "workflow": r.get("workflow"),
-                "commit_sha": r.get("commit_sha"),
-                "actor": r.get("actor"),
-                "status": r.get("conclusion") or r.get("status"),
-                "timestamp": r.get("updated_at") or r.get("created_at"),
-                "url": r.get("html_url"),
+                "deployment_id": data.get("deployment_id"),
+                "workflow": data.get("workflow_name"),
+                "commit_sha": data.get("commit_hash"),
+                "actor": data.get("actor"),
+                "status": data.get("status"),
+                "timestamp": data.get("timestamp").isoformat() if hasattr(data.get("timestamp"), "isoformat") else data.get("timestamp"),
+                "url": data.get("url"),
+                "source_of_truth": data.get("source_of_truth"),
+                "confidence_origin": data.get("confidence_origin"),
             })
         return events
 
     async def correlate_with_incident(self, incident: Dict[str, Any], repo: str) -> Dict[str, Any]:
         # Fetch recent deployments and find ones within timeframe
         events = await self.fetch_recent_deployments(repo)
-        t = incident.get("timestamp")
+        correlation = correlate_deployment_events(incident)
         matched = []
         for e in events:
-            if e.get("commit_sha") and incident.get("commit_hash"):
-                if e.get("commit_sha") == incident.get("commit_hash"):
-                    matched.append(e)
-        return {"matched": bool(matched), "events": matched}
+            if e.get("commit_sha") and incident.get("commit_hash") and e.get("commit_sha") == incident.get("commit_hash"):
+                matched.append(e)
+        return {"matched": bool(matched) or correlation.get("matched", False), "events": matched or correlation.get("events", []), "score": correlation.get("score", 0.0)}

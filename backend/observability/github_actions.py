@@ -1,19 +1,9 @@
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 import httpx
 from datetime import datetime
-from dataclasses import dataclass
 
-@dataclass
-class DeploymentEvent:
-    deployment_id: str
-    commit_hash: str
-    workflow_name: str
-    service: str
-    environment: str
-    status: str
-    timestamp: datetime
-    rollback_of: Optional[str] = None
+from ontology import Deployment
 
 class GitHubActionsIngest:
     """Fetch GitHub Actions workflow runs for a repository and emit DeploymentEvents."""
@@ -22,7 +12,7 @@ class GitHubActionsIngest:
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.base = "https://api.github.com"
 
-    async def fetch_runs(self, repo: str, per_page: int = 50) -> List[DeploymentEvent]:
+    async def fetch_runs(self, repo: str, per_page: int = 50) -> List[Deployment]:
         headers = {"Accept": "application/vnd.github+json"}
         if self.token:
             headers["Authorization"] = f"token {self.token}"
@@ -60,14 +50,19 @@ class GitHubActionsIngest:
                 if "revert" in workflow_name.lower() or "rollback" in workflow_name.lower():
                     rollback_of = "previous"
 
-                out.append(DeploymentEvent(
+                out.append(Deployment(
+                    source_of_truth="github_actions",
+                    timestamp=ts,
+                    confidence_origin="workflow_run_metadata",
+                    evidence_origin=[r.get("html_url", ""), repo],
                     deployment_id=str(r.get("id", "")),
                     commit_hash=r.get("head_sha", ""),
                     workflow_name=workflow_name,
                     service=service,
                     environment=env,
                     status=r.get("conclusion") or r.get("status") or "unknown",
-                    timestamp=ts,
-                    rollback_of=rollback_of
+                    rollback_of=rollback_of,
+                    actor=r.get("actor", {}).get("login") if isinstance(r.get("actor"), dict) else None,
+                    url=r.get("html_url"),
                 ))
             return out
