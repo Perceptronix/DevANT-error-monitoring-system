@@ -4,7 +4,7 @@ Application configuration with feature flags for optional integrations.
 This module centralizes all configuration, making it easy to:
 - Run with just sample data (default, zero friction)
 - Connect real data sources (Sentry, Azure, etc.)
-- Enable real integrations (Linear, Slack)
+- Use Groq for semantic processing
 """
 import os
 from dataclasses import dataclass, field
@@ -13,48 +13,39 @@ from functools import lru_cache
 
 
 @dataclass
-class IntegrationConfig:
-    """Configuration for an optional integration."""
+class GroqConfig:
+    """Groq API configuration."""
+    api_key: Optional[str] = None
+    model: str = "llama3-70b-8192"
+    
+    @property
+    def is_configured(self) -> bool:
+        """Check if Groq is configured."""
+        return bool(self.api_key)
+
+
+@dataclass
+class GitHubConfig:
+    """GitHub API configuration for code context."""
     enabled: bool = False
-    api_key: Optional[str] = None
+    token: Optional[str] = None
+    repo: Optional[str] = None
     
     @property
     def is_configured(self) -> bool:
-        """Check if integration is both enabled AND has credentials."""
-        return self.enabled and bool(self.api_key)
+        """Check if GitHub is configured and enabled."""
+        return self.enabled and bool(self.token) and bool(self.repo)
 
 
 @dataclass
-class LinearConfig(IntegrationConfig):
-    """Linear-specific configuration."""
-    team_id: Optional[str] = None
+class ChromaDBConfig:
+    """ChromaDB vector store configuration."""
+    persist_dir: str = "./data/chroma"
     
     @property
     def is_configured(self) -> bool:
-        return self.enabled and bool(self.api_key) and bool(self.team_id)
-
-
-@dataclass 
-class SlackConfig(IntegrationConfig):
-    """Slack-specific configuration."""
-    channel_id: Optional[str] = None
-    signing_secret: Optional[str] = None
-    
-    @property
-    def is_configured(self) -> bool:
-        return self.enabled and bool(self.api_key) and bool(self.channel_id)
-
-
-@dataclass
-class AirweaveConfig:
-    """Airweave configuration (required for context search)."""
-    api_key: Optional[str] = None
-    api_url: str = "https://api.airweave.ai"
-    collection_id: Optional[str] = None
-    
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.api_key) and bool(self.collection_id)
+        """ChromaDB is always available with local persistence."""
+        return True
 
 
 @dataclass
@@ -138,41 +129,90 @@ class LLMConfig:
 
 
 @dataclass
+class LegacyAirweaveConfig:
+    """Compatibility shim for older code expecting Airweave config."""
+    api_key: Optional[str] = None
+    api_url: str = "https://api.airweave.ai"
+    collection_id: Optional[str] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_key and self.collection_id)
+
+
+@dataclass
+class LegacyIntegrationConfig:
+    enabled: bool = False
+    api_key: Optional[str] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return self.enabled and bool(self.api_key)
+
+
+@dataclass
+class LegacyLinearConfig(LegacyIntegrationConfig):
+    team_id: Optional[str] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return self.enabled and bool(self.api_key) and bool(self.team_id)
+
+
+@dataclass
+class LegacySlackConfig(LegacyIntegrationConfig):
+    channel_id: Optional[str] = None
+    signing_secret: Optional[str] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return self.enabled and bool(self.api_key) and bool(self.channel_id)
+
+
+@dataclass
 class Config:
     """
     Main application configuration.
     
     Collects all configuration from environment variables.
-    Integrations are disabled by default for zero-friction demo experience.
+    Uses Groq for LLM tasks and ChromaDB for vector storage.
     """
-    # Required
-    airweave: AirweaveConfig = field(default_factory=AirweaveConfig)
+    # Required components
+    groq: GroqConfig = field(default_factory=GroqConfig)
+    chroma: ChromaDBConfig = field(default_factory=ChromaDBConfig)
+    
+    # Optional: GitHub for code context
+    github: GitHubConfig = field(default_factory=GitHubConfig)
+
+    # Legacy/backward-compatible integrations (Airweave, LLM, Linear, Slack)
+    airweave: LegacyAirweaveConfig = field(default_factory=LegacyAirweaveConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    linear: LegacyLinearConfig = field(default_factory=LegacyLinearConfig)
+    slack: LegacySlackConfig = field(default_factory=LegacySlackConfig)
     
     # Data source (sample by default)
     data_source: DataSourceConfig = field(default_factory=DataSourceConfig)
     
-    # Optional integrations (disabled by default)
-    linear: LinearConfig = field(default_factory=LinearConfig)
-    slack: SlackConfig = field(default_factory=SlackConfig)
-    
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
-        return cls(
-            # Airweave (required for context search)
-            airweave=AirweaveConfig(
-                api_key=os.getenv("AIRWEAVE_API_KEY"),
-                api_url=os.getenv("AIRWEAVE_API_URL", "https://api.airweave.ai"),
-                collection_id=os.getenv("AIRWEAVE_COLLECTION_ID"),
+        cfg = cls(
+            # Groq (required for semantic processing)
+            groq=GroqConfig(
+                api_key=os.getenv("GROQ_API_KEY"),
+                model=os.getenv("GROQ_MODEL", "llama3-70b-8192"),
             ),
             
-            # LLM
-            llm=LLMConfig(
-                anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-                openai_api_key=os.getenv("OPENAI_API_KEY"),
-                anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
-                openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            # ChromaDB (always configured locally)
+            chroma=ChromaDBConfig(
+                persist_dir=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma"),
+            ),
+            
+            # GitHub (optional)
+            github=GitHubConfig(
+                enabled=os.getenv("GITHUB_ENABLED", "true").lower() == "true",
+                token=os.getenv("GITHUB_TOKEN"),
+                repo=os.getenv("GITHUB_REPO"),
             ),
             
             # Data source
@@ -193,22 +233,36 @@ class Config:
                 datadog_app_key=os.getenv("DATADOG_APP_KEY"),
                 datadog_site=os.getenv("DATADOG_SITE", "datadoghq.com"),
             ),
-            
-            # Linear (disabled by default)
-            linear=LinearConfig(
-                enabled=os.getenv("LINEAR_ENABLED", "false").lower() == "true",
-                api_key=os.getenv("LINEAR_API_KEY"),
-                team_id=os.getenv("LINEAR_TEAM_ID"),
-            ),
-            
-            # Slack (disabled by default)
-            slack=SlackConfig(
-                enabled=os.getenv("SLACK_ENABLED", "false").lower() == "true",
-                api_key=os.getenv("SLACK_BOT_TOKEN"),
-                channel_id=os.getenv("SLACK_CHANNEL_ID"),
-                signing_secret=os.getenv("SLACK_SIGNING_SECRET"),
-            ),
         )
+
+        # Populate legacy integration fields for backward compatibility
+        cfg.airweave = LegacyAirweaveConfig(
+            api_key=os.getenv("AIRWEAVE_API_KEY"),
+            api_url=os.getenv("AIRWEAVE_API_URL", "https://api.airweave.ai"),
+            collection_id=os.getenv("AIRWEAVE_COLLECTION_ID"),
+        )
+
+        cfg.llm = LLMConfig(
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        )
+
+        cfg.linear = LegacyLinearConfig(
+            enabled=os.getenv("LINEAR_ENABLED", "false").lower() == "true",
+            api_key=os.getenv("LINEAR_API_KEY"),
+            team_id=os.getenv("LINEAR_TEAM_ID"),
+        )
+
+        cfg.slack = LegacySlackConfig(
+            enabled=os.getenv("SLACK_ENABLED", "false").lower() == "true",
+            api_key=os.getenv("SLACK_BOT_TOKEN"),
+            channel_id=os.getenv("SLACK_CHANNEL_ID"),
+            signing_secret=os.getenv("SLACK_SIGNING_SECRET"),
+        )
+
+        return cfg
     
     def get_status(self) -> Dict[str, Any]:
         """
@@ -217,14 +271,18 @@ class Config:
         Returns dict showing what's configured and active.
         """
         return {
-            "airweave": {
-                "configured": self.airweave.is_configured,
-                "collection_id": self.airweave.collection_id[:8] + "..." if self.airweave.collection_id else None,
+            "groq": {
+                "configured": self.groq.is_configured,
+                "model": self.groq.model if self.groq.is_configured else None,
             },
-            "llm": {
-                "configured": self.llm.is_configured,
-                "provider": self.llm.provider,
-                "model": self.llm.model,
+            "chroma": {
+                "configured": self.chroma.is_configured,
+                "persist_dir": self.chroma.persist_dir,
+            },
+            "github": {
+                "enabled": self.github.enabled,
+                "configured": self.github.is_configured,
+                "repo": self.github.repo if self.github.is_configured else None,
             },
             "data_source": {
                 "type": self.data_source.source_type,
@@ -233,18 +291,6 @@ class Config:
                     "azure": self.data_source.azure_configured,
                     "sentry": self.data_source.sentry_configured,
                     "datadog": self.data_source.datadog_configured,
-                },
-            },
-            "integrations": {
-                "linear": {
-                    "enabled": self.linear.enabled,
-                    "configured": self.linear.is_configured,
-                    "mode": "live" if self.linear.is_configured else "preview",
-                },
-                "slack": {
-                    "enabled": self.slack.enabled,
-                    "configured": self.slack.is_configured,
-                    "mode": "live" if self.slack.is_configured else "preview",
                 },
             },
         }

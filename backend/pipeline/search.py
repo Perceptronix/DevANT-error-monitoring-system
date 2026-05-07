@@ -1,10 +1,12 @@
 """
-Airweave-powered context search for error enrichment.
-Searches for related code, tickets, and documentation.
+ChromaDB-powered context search for error enrichment.
+Searches for related code, tickets, and documentation using semantic similarity.
 """
 import os
 import logging
 from typing import List, Dict, Any, Optional
+
+from clients.chroma_client import ChromaClient
 
 logger = logging.getLogger(__name__)
 
@@ -23,28 +25,21 @@ class ContextSearcher:
         self._init_airweave()
     
     def _init_airweave(self):
-        """Initialize the Airweave client."""
-        api_key = os.getenv("AIRWEAVE_API_KEY")
-        api_url = os.getenv("AIRWEAVE_API_URL", "https://api.airweave.ai")
-        self.collection_id = os.getenv("AIRWEAVE_COLLECTION_ID")
-        
-        if api_key and self.collection_id:
-            try:
-                from airweave import AirweaveSDK
-                self.client = AirweaveSDK(
-                    api_key=api_key,
-                    base_url=api_url
+        """Initialize the ChromaDB client."""
+        try:
+            self.client = ChromaClient(
+                persist_dir=os.getenv(
+                    "CHROMA_PERSIST_DIR",
+                    "./data/chroma"
                 )
-                self.configured = True
-                logger.info("Airweave client initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Airweave: {e}")
-                self.client = None
-                self.configured = False
-        else:
+            )
+            self.configured = True
+            self.collection_id = None
+            logger.info("ChromaDB client initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ChromaDB: {e}")
             self.client = None
             self.configured = False
-            logger.warning("Airweave not configured - using mock search results")
     
     async def search_context(self, clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -101,41 +96,39 @@ class ContextSearcher:
             return self._mock_search(cluster)
     
     async def _search_source(
-        self, 
-        query: str, 
+        self,
+        query: str,
         source_filter: Optional[str] = None,
         limit: int = 5
-    ) -> List[Dict[str, Any]]:
-        """Search a specific source in Airweave."""
+    ) -> List[Dict]:
+        """Search ChromaDB for relevant context."""
         try:
-            # Use the Airweave search API
-            search_params = {
-                "query": query,
-                "limit": limit,
-            }
-            
-            if source_filter:
-                search_params["source_name"] = source_filter
-            
-            response = await self.client.search.search(
-                collection_id=self.collection_id,
-                **search_params
+            results = await self.client.search(
+                query=query,
+                source_filter=source_filter,
+                limit=limit
             )
-            
-            results = []
-            for item in response.results[:limit]:
-                results.append({
-                    "title": getattr(item, 'title', 'Untitled'),
-                    "content": getattr(item, 'content', '')[:500],
-                    "source": getattr(item, 'source_name', 'unknown'),
-                    "url": getattr(item, 'url', None),
-                    "score": getattr(item, 'score', 0),
+
+            formatted = []
+
+            for r in results:
+                formatted.append({
+                    "title": r.get("metadata", {}).get(
+                        "title",
+                        r.get("metadata", {}).get(
+                            "path",
+                            "Untitled"
+                        )
+                    ),
+                    "content": r.get("content", "")[:500],
+                    "source": source_filter or "unknown",
+                    "url": r.get("metadata", {}).get("url"),
+                    "score": r.get("score", 0)
                 })
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Search failed for source {source_filter}: {e}")
+
+            return formatted
+
+        except Exception:
             return []
     
     def _mock_search(self, cluster: Dict[str, Any]) -> Dict[str, Any]:

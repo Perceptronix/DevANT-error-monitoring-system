@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from schemas import PreviousErrorState
 from state import get_state_manager
+from backend.memory.hybrid_search import HybridRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ class ErrorAnalysis(BaseModel):
     impact: str = Field(description="Description of the impact on users/system")
     suggested_action: str = Field(description="Recommended next steps to resolve")
     reasoning: str = Field(description="Explanation of how severity was determined")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score (0.0-1.0) for the analysis")
+    evidence_count: int = Field(description="Number of evidence items used for reasoning")
+    deployment_correlation: bool = Field(description="Whether a deployment correlation was found")
+    historical_match: bool = Field(description="Whether historical incidents matched this one")
 
 
 class ErrorAnalyzer:
@@ -69,6 +74,11 @@ class ErrorAnalyzer:
         self.last_reasoning: Optional[str] = None
         self.state = get_state_manager()
         self._init_llm()
+        # Hybrid retriever for grounded operational evidence
+        try:
+            self.hybrid = HybridRetriever()
+        except Exception:
+            self.hybrid = None
     
     def _init_llm(self):
         """Initialize the LLM client."""
@@ -118,24 +128,30 @@ class ErrorAnalyzer:
         analyses = []
         all_reasoning = []
         
-        # Build context lookup
-        context_map = {
-            r.get("cluster_signature", ""): r.get("context", {})
-            for r in context_results
-        }
+        # Note: context_results (legacy) may still be provided but we will
+        # prefer hybrid retrieval that produces a grounded evidence bundle.
         
         for cluster in clusters:
             signature = cluster.get("signature", "")
-            context = context_map.get(signature, {})
-            
+            # Hybrid retrieval: get grounded evidence bundle
+            evidence_bundle = None
+            try:
+                if self.hybrid:
+                    evidence_bundle = await self.hybrid.retrieve(cluster)
+            except Exception as e:
+                logger.warning(f"Hybrid retrieval failed for {signature[:40]}: {e}")
+
+            # If hybrid retrieval failed, fall back to legacy context mapping
+            context = (evidence_bundle or {}).get("evidences") if evidence_bundle else None
+
             if self.llm:
                 try:
-                    analysis = await self._llm_analyze(cluster, context)
+                    analysis = await self._llm_analyze(cluster, evidence_bundle or {})
                 except Exception as e:
                     logger.error(f"LLM analysis failed: {e}", exc_info=True)
-                    analysis = self._fallback_analysis(cluster, context)
+                    analysis = self._fallback_analysis(cluster, evidence_bundle or {})
             else:
-                analysis = self._fallback_analysis(cluster, context)
+                analysis = self._fallback_analysis(cluster, evidence_bundle or {})
             
             analyses.append(analysis)
             if analysis.get("reasoning"):
@@ -155,57 +171,81 @@ class ErrorAnalyzer:
         
         parser = JsonOutputParser(pydantic_object=ErrorAnalysis)
         
-        # Build context string
+        # Build context string from grounded evidence bundle or legacy context
         context_parts = []
-        
-        if context.get("code_snippets"):
-            context_parts.append("**Related Code:**")
-            for snippet in context["code_snippets"][:2]:
-                context_parts.append(f"- {snippet.get('title', 'Code')}: {snippet.get('content', '')[:300]}")
-        
-        if context.get("related_tickets"):
-            context_parts.append("\n**Related Tickets:**")
-            for ticket in context["related_tickets"][:2]:
-                context_parts.append(f"- {ticket.get('title', 'Ticket')}: {ticket.get('content', '')[:200]}")
-        
+
+        # If evidence bundle produced by HybridRetriever
+        if isinstance(context, dict) and context.get("evidences") is not None:
+            evidences = context.get("evidences", [])
+            if evidences:
+                context_parts.append("**Top Evidence:**")
+                for ev in evidences[:4]:
+                    title = ev.get("title") or ev.get("metadata", {}).get("title", "")
+                    src = ev.get("source")
+                    url = ev.get("url") or ev.get("metadata", {}).get("url", "")
+                    context_parts.append(f"- [{src}] {title} ({url}) Score:{ev.get('final_score', ev.get('base_score', 0)):.2f}")
+
+            dep = context.get("deployment_correlation")
+            if dep:
+                context_parts.append(f"**Deployment Correlation:** matched={dep.get('matched', False)} score={dep.get('score', 0):.2f}")
+
+            # include simple metadata
+            meta = context.get("metadata") or {}
+            if meta:
+                context_parts.append(f"**Evidence Count:** {meta.get('evidence_count', 0)}  **Confidence:** {meta.get('confidence', 0):.2f}")
+
+        else:
+            # Legacy context format
+            if context and isinstance(context, dict) and context.get("code_snippets"):
+                context_parts.append("**Related Code:**")
+                for snippet in context["code_snippets"][:2]:
+                    context_parts.append(f"- {snippet.get('title', 'Code')}: {snippet.get('content', '')[:300]}")
+
+            if context and isinstance(context, dict) and context.get("related_tickets"):
+                context_parts.append("\n**Related Tickets:**")
+                for ticket in context["related_tickets"][:2]:
+                    context_parts.append(f"- {ticket.get('title', 'Ticket')}: {ticket.get('content', '')[:200]}")
+
         context_str = "\n".join(context_parts) if context_parts else "No additional context available."
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are analyzing production errors to determine severity and impact.
 
-Severity Guidelines (be conservative - most errors should be S3 or S4):
-- **S1 (Critical)**: Complete service outage, data loss/corruption, security breach, ALL users affected
-- **S2 (High)**: Major feature broken, significant user impact (>10% users), potential data issues
-- **S3 (Medium)**: Feature degraded, limited user impact (<10% users), workaround available
-- **S4 (Low)**: Minor issue, cosmetic, no immediate action required, single user affected
+    MANDATES:
+    - Do NOT invent deployments, commits, owners, metrics, or historical incidents.
+    - Only use the provided, retrieved evidence and structured incident data.
+    - Every factual claim MUST reference evidence by index, URL, or field from the evidence bundle.
+    - If evidence is insufficient, respond with "Insufficient evidence" rather than guessing.
 
-Title Guidelines:
-- Create a short, actionable title (5-10 words) suitable for tickets and alerts
-- Focus on WHAT is happening, not the technical error class
-- Good: "Google Drive rate limits exceeded", "Database connection pool exhausted", "OAuth tokens expired for user integrations"
-- Bad: "HttpError 429", "OperationalError", "Exception in sync_worker"
+    Severity Guidelines (be conservative - most errors should be S3 or S4):
+    - **S1 (Critical)**: Complete service outage, data loss/corruption, security breach, ALL users affected
+    - **S2 (High)**: Major feature broken, significant user impact (>10% users), potential data issues
+    - **S3 (Medium)**: Feature degraded, limited user impact (<10% users), workaround available
+    - **S4 (Low)**: Minor issue, cosmetic, no immediate action required, single user affected
 
-Consider:
-- Number of organizations affected
-- Whether there are existing tickets (might be known issue)
-- Error frequency and pattern
-- Whether it's a new error or regression
+    Title Guidelines:
+    - Create a short, actionable title (5-10 words) suitable for tickets and alerts
+    - Focus on WHAT is happening, not the technical error class
 
-{format_instructions}"""),
+    Output Requirements:
+    - Provide a JSON object matching the required schema including `confidence`, `evidence_count`, `deployment_correlation`, and `historical_match`.
+    - Include a brief `reasoning` field that cites evidence items (e.g., "evidence[0].url", "deployment_events[1]").
+
+    {format_instructions}"""),
             ("user", """Analyze this error cluster:
 
-**Signature:** {signature}
+    **Signature:** {signature}
 
-**Error Count:** {error_count}
-**Organizations Affected:** {orgs}
+    **Error Count:** {error_count}
+    **Organizations Affected:** {orgs}
 
-**Sample Error:**
-{sample_message}
+    **Sample Error:**
+    {sample_message}
 
-**Context:**
-{context}
+    **Evidence Bundle (do NOT invent additional facts):**
+    {context}
 
-Determine severity, create an actionable title, identify root cause, assess impact, and suggest action.""")
+    Determine severity, create an actionable title, identify root cause, assess impact, and suggest action. If you cannot reach a conclusion from evidence, state "Insufficient evidence" and set `confidence` accordingly.""")
         ])
         
         chain = prompt | self.llm | parser
