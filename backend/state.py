@@ -55,6 +55,7 @@ class StateManager:
         
         self.signatures_file = self.data_dir / "error_signatures.json"
         self.mutes_file = self.data_dir / "mutes.json"
+        self.kv_file = self.data_dir / "kv_store.json"
         
         self._ensure_files()
         logger.info(f"State manager initialized with data dir: {self.data_dir}")
@@ -65,6 +66,9 @@ class StateManager:
             if not file_path.exists():
                 file_path.write_text("{}")
                 logger.info(f"Created state file: {file_path}")
+        if not self.kv_file.exists():
+            self.kv_file.write_text("{}")
+            logger.info(f"Created kv store file: {self.kv_file}")
     
     def _read_json(self, path: Path) -> dict:
         """Read JSON file with locking."""
@@ -74,14 +78,54 @@ class StateManager:
                 content = path.read_text()
                 return json.loads(content) if content.strip() else {}
             except (json.JSONDecodeError, FileNotFoundError) as e:
-                logger.warning(f"Error reading {path}: {e}, returning empty dict")
+                logger.warning(f"Error reading {path}: {e}, attempting recovery")
+                # Backup corrupted file
+                try:
+                    bak = path.with_suffix(path.suffix + f".bak.{datetime.utcnow().timestamp()}")
+                    path.replace(bak)
+                    logger.warning(f"Backed up corrupted state to {bak}")
+                except Exception:
+                    logger.exception("Failed to backup corrupted state file")
+                # Create a fresh empty file
+                try:
+                    path.write_text("{}")
+                except Exception:
+                    logger.exception("Failed to create fresh state file after corruption")
                 return {}
     
     def _write_json(self, path: Path, data: dict):
         """Write JSON file with locking."""
         lock_path = f"{path}.lock"
         with FileLock(lock_path):
-            path.write_text(json.dumps(data, indent=2, default=str))
+            # Atomic write: write to temp file then replace
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, default=str))
+            try:
+                tmp.replace(path)
+            except Exception:
+                # Fallback to overwrite
+                path.write_text(json.dumps(data, indent=2, default=str))
+
+    # =========================================================================
+    # Generic KV store helpers (for tests/compatibility)
+    # =========================================================================
+
+    def update(self, key: str, value: Dict[str, Any]):
+        """Generic key/value update persisted to kv_store.json."""
+        data = self._read_json(self.kv_file)
+        data[key] = value
+        self._write_json(self.kv_file, data)
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        data = self._read_json(self.kv_file)
+        return data.get(key)
+
+    def persist(self):
+        """Ensure all state files are flushed and consistent (noop for JSON store)."""
+        # Files are written synchronously; this is a semantic hook for interfaces
+        for p in [self.signatures_file, self.mutes_file, self.kv_file]:
+            if not p.exists():
+                p.write_text("{}")
     
     # =========================================================================
     # Error Signatures

@@ -1,12 +1,12 @@
 import asyncio
 from typing import Dict, Any, List
 
-from backend.clients.chroma_client import get_chroma_client
+from clients.chroma_client import get_chroma_client
 from .retrieval import normalize_stacktrace, extract_function_tokens, stacktrace_score
 from .deployment_correlation import DeploymentCorrelator
-from backend.observability.deployment_tracker import DeploymentTracker
-from backend.observability.service_map import owners_for_service
-from backend.observability.rollback_engine import RollbackEngine
+from observability.deployment_tracker import DeploymentTracker
+from observability.service_map import owners_for_service
+from observability.rollback_engine import RollbackEngine
 from .reranker import RetrievalReranker
 from .evidence_builder import EvidenceBuilder
 

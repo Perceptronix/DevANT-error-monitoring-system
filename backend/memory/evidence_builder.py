@@ -12,6 +12,7 @@ class EvidenceBuilder:
         evidences: List[Dict[str, Any]],
         correlation: Dict[str, Any],
         incident: Dict[str, Any],
+        history: List[Dict[str, Any]] = None,
         deployments: List[Dict[str, Any]] = None,
         ownership: List[str] = None,
         rollback_candidates: List[Dict[str, Any]] = None,
@@ -46,6 +47,7 @@ class EvidenceBuilder:
 
         bundle = {
             "evidences": evidences,
+            "history": history or [],
             "deployment_events": deployments or [],
             "ownership": ownership or [],
             "rollback_candidates": rollback_candidates or [],

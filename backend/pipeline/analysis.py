@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from schemas import PreviousErrorState
 from state import get_state_manager
-from backend.memory.hybrid_search import HybridRetriever
+from memory.hybrid_search import HybridRetriever
 
 logger = logging.getLogger(__name__)
 

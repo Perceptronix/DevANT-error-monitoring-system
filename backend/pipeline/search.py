@@ -135,6 +135,35 @@ class ContextSearcher:
         """Return mock search results for demo without Airweave configured."""
         signature = cluster.get("signature", "Unknown error")
         modules = cluster.get("modules", ["unknown"])
+
+        async def search(self, query: str, limit: int = 5, source_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+            """Compatibility wrapper returning a flat list of results for simple `search` calls.
+
+            This method is a thin, backward-compatible adapter used by tests and
+            older callers that expect an async `search(query, limit)` API.
+            """
+            if self.configured and self.client:
+                try:
+                    results = await self.client.search(query=query, source_filter=source_filter, limit=limit)
+                    formatted = []
+                    for r in results:
+                        formatted.append({
+                            "content": r.get("content", ""),
+                            "metadata": r.get("metadata", {}),
+                            "score": r.get("score", 0),
+                        })
+                    return formatted
+                except Exception:
+                    return []
+
+            # Fallback to mock search
+            cluster = {"signature": query, "modules": []}
+            context = self._mock_search(cluster)
+            out = []
+            for src in ("code_snippets", "related_tickets", "documentation"):
+                for item in context.get(src, []):
+                    out.append({"content": item.get("content"), "metadata": {"title": item.get("title"), "url": item.get("url")}, "score": item.get("score", 0)})
+            return out
         
         # Generate realistic mock results based on the error
         mock_code = []

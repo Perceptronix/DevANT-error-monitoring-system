@@ -1,21 +1,23 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import datetime
 
 
 @dataclass
 class IncidentMemory:
+    incident_id: str
     error_signature: str
     service: str
     stack_trace: str
-    deployment_id: str
-    commit_hash: str
-    owner: str
-    severity: str
-    historical_matches: List[str]
-    root_cause: str
-    resolution: str
-    timestamp: str
+    deployment_id: Optional[str] = None
+    commit_hash: Optional[str] = None
+    owner: Optional[str] = None
+    severity: str = "unknown"
+    root_cause: Optional[str] = None
+    resolution: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    status: str = "open"
+    historical_matches: List[str] = field(default_factory=list)
 
 
 class IncidentGraph:

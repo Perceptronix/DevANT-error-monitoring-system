@@ -118,26 +118,21 @@ class ErrorEnricher:
         sample_messages: List[str],
     ) -> str:
         """Build an effective search query from error info."""
-        parts = []
-        
-        # Add module and function
-        if module:
-            parts.append(module)
-        if function:
-            parts.append(function)
-        
-        # Add key terms from signature (remove noise)
-        sig_parts = signature.split()
-        for part in sig_parts:
-            # Skip common noise words
-            if part.lower() in ["error", "in", "at", "the", "a", "an", "and", "or"]:
-                continue
-            if len(part) > 3:
-                parts.append(part)
-        
-        # Add key terms from first sample message
-        if sample_messages:
-            msg = sample_messages[0][:200]
+        """
+        Error enrichment with context from ChromaDB.
+
+        Enriches error clusters with:
+        - Related code snippets from GitHub (via ChromaDB)
+        - Related tickets from GitHub issues
+        - Comprehensive LLM-generated summary
+        """
+        import asyncio
+        import logging
+        import os
+        from typing import Dict, Any, List, Optional
+
+        from schemas import ErrorCluster, EnrichedError, CodeSnippet, RelatedTicket
+        from clients import ChromaClient
             # Extract error type if present
             if "Error:" in msg:
                 error_part = msg.split("Error:")[0].strip().split()[-1]
@@ -146,9 +141,16 @@ class ErrorEnricher:
         
         # Dedupe and limit
         seen = set()
-        unique_parts = []
-        for p in parts:
-            if p.lower() not in seen:
+            Uses ChromaDB for semantic code/ticket search.
+                try:
+                    self.chroma = ChromaClient()
+                except Exception as e:
+                try:
+                    self.chroma = ChromaClient()
+                except Exception as e:
+                    logger.warning(f"Failed to initialize ChromaDB: {e}")
+                    self.chroma = None
+                    self.chroma = None
                 seen.add(p.lower())
                 unique_parts.append(p)
         

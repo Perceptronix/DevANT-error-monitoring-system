@@ -1,6 +1,15 @@
 import re
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+
+try:
+    from ..contracts.retrieval import BaseRetriever
+except Exception:
+    # fallback path when executed as script from backend/
+    try:
+        from contracts.retrieval import BaseRetriever
+    except Exception:
+        BaseRetriever = None
 
 
 @lru_cache(maxsize=1024)
@@ -56,3 +65,43 @@ def stacktrace_score(a: str, b: str) -> float:
     overlap = ta.intersection(tb)
     score = len(overlap) / max(len(ta), len(tb))
     return float(score)
+
+
+class ContractRetriever:
+    """Thin adapter that conforms to the BaseRetriever contract (if available).
+
+    This adapter wraps any object exposing an async `search(query, limit)` method.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def search(self, query: str, limit: int = 10):
+        # Delegate if async
+        if hasattr(self.inner, "search"):
+            res = self.inner.search(query=query, limit=limit)
+            # If result is awaitable, await it
+            if hasattr(res, "__await__"):
+                return await res
+            return res
+        return []
+
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim for tests: SemanticRetriever
+# ---------------------------------------------------------------------------
+class SemanticRetriever:
+    """Minimal compatibility wrapper around a ChromaClient instance.
+
+    This class exists only to satisfy test imports and provides a thin
+    async `search` method delegating to a provided chroma client.
+    """
+    def __init__(self, chroma_client=None):
+        self.chroma_client = chroma_client
+
+    async def search(self, query: str, limit: int = 5):
+        if not self.chroma_client:
+            return []
+
+        return await self.chroma_client.search(query=query, limit=limit)
