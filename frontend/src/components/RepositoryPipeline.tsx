@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronRight } from 'lucide-react'
 import { StatusDot, StatusColor } from '@/components/ui/StatusDot'
 import PropagationCard from '@/components/PropagationCard'
 import TemporalMemoryCard from '@/components/TemporalMemoryCard'

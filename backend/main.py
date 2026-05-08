@@ -9,6 +9,9 @@ It features:
 - Smart suppression logic (NEW/REGRESSION/ONGOING)
 - Optional GitHub Issues and Slack integrations with preview fallbacks
 """
+import os
+from dotenv import load_dotenv
+load_dotenv()
 import asyncio
 import json
 import logging
@@ -17,14 +20,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
-# Load environment variables first
-load_dotenv()
 
 # Import our modules
 from config import get_config
@@ -50,241 +49,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- Pydantic Models ---
-
-class PipelineConfig(BaseModel):
-    """Configuration for running the pipeline."""
-    use_sample_data: bool = True
-    custom_errors: Optional[List[Dict[str, Any]]] = None
-    include_extended_samples: bool = False
-
-
-class PipelineStep(BaseModel):
-    """Represents a single step in the pipeline."""
-    id: str
-    name: str
-    status: str  # "pending", "running", "completed", "error"
-    data: Optional[Dict[str, Any]] = None
-    reasoning: Optional[str] = None
-    duration_ms: Optional[int] = None
-
-
-class PipelineState(BaseModel):
-    """Current state of the pipeline."""
-    run_id: str
-    status: str  # "idle", "running", "completed", "error"
-    current_step: int
-    steps: List[PipelineStep]
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-
-
-# --- WebSocket Connection Manager ---
-
-class ConnectionManager:
-    """Manages WebSocket connections for real-time updates."""
-    
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"Client connected. Total connections: {len(self.active_connections)}")
-    
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-        logger.info(f"Client disconnected. Total connections: {len(self.active_connections)}")
-    
-    async def broadcast(self, message: dict):
-        """Send message to all connected clients."""
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Error sending message: {e}")
-
-
-manager = ConnectionManager()
-
-
-# --- Pipeline Execution ---
-
-async def run_pipeline(config: PipelineConfig) -> PipelineState:
-    """
-    Run the error monitoring pipeline with real-time updates.
-    """
-    run_id = f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
-    
-    # Initialize pipeline state
-    steps = [
-        PipelineStep(id="raw-errors", name="Raw Errors", status="pending"),
-        PipelineStep(id="clustering", name="Semantic Clustering", status="pending"),
-        PipelineStep(id="context-search", name="Context Search", status="pending"),
-        PipelineStep(id="analysis", name="Severity Analysis", status="pending"),
-        PipelineStep(id="alert-preview", name="Alert Preview", status="pending"),
-    ]
-    
-    state = PipelineState(
-        run_id=run_id,
-        status="running",
-        current_step=0,
-        steps=steps,
-        started_at=datetime.utcnow().isoformat()
-    )
-    
-    # Broadcast initial state
-    await manager.broadcast({"type": "pipeline_started", "state": state.model_dump()})
-    
-    try:
-        # Initialize pipeline components
-        clusterer = ErrorClusterer()
-        searcher = ContextSearcher()
-        analyzer = ErrorAnalyzer()
-        
-        # Step 1: Raw Errors
-        state.current_step = 0
-        state.steps[0].status = "running"
-        await manager.broadcast({"type": "step_started", "step_id": "raw-errors", "state": state.model_dump()})
-        
-        start_time = datetime.utcnow()
-        
-        if config.use_sample_data:
-            errors = get_sample_errors(include_extended=config.include_extended_samples)
-        else:
-            errors = config.custom_errors or []
-        
-        # Set data while still running so UI can show it expanding
-        state.steps[0].data = {
-            "error_count": len(errors),
-            "errors": errors,
-            "orgs_affected": list(set(e.get("org_name", "Unknown") for e in errors))
-        }
-        await manager.broadcast({"type": "step_data_ready", "step_id": "raw-errors", "state": state.model_dump()})
-        await asyncio.sleep(1.5)  # Pause so users can see the data
-        
-        state.steps[0].status = "completed"
-        state.steps[0].duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
-        await manager.broadcast({"type": "step_completed", "step_id": "raw-errors", "state": state.model_dump()})
-        await asyncio.sleep(0.3)  # Brief pause before next step
-        
-        # Step 2: Semantic Clustering
-        state.current_step = 1
-        state.steps[1].status = "running"
-        await manager.broadcast({"type": "step_started", "step_id": "clustering", "state": state.model_dump()})
-        
-        start_time = datetime.utcnow()
-        clusters = await clusterer.cluster_errors(errors)
-        
-        # Set data while still running so UI can show it expanding
-        state.steps[1].data = {
-            "cluster_count": len(clusters),
-            "clusters": clusters,
-            "reduction": f"{len(errors)} errors → {len(clusters)} clusters"
-        }
-        state.steps[1].reasoning = clusterer.last_reasoning
-        await manager.broadcast({"type": "step_data_ready", "step_id": "clustering", "state": state.model_dump()})
-        await asyncio.sleep(1.5)  # Pause so users can see the data
-        
-        state.steps[1].status = "completed"
-        state.steps[1].duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
-        await manager.broadcast({"type": "step_completed", "step_id": "clustering", "state": state.model_dump()})
-        await asyncio.sleep(0.3)
-        
-        # Step 3: Context Search (Airweave)
-        state.current_step = 2
-        state.steps[2].status = "running"
-        await manager.broadcast({"type": "step_started", "step_id": "context-search", "state": state.model_dump()})
-        
-        start_time = datetime.utcnow()
-        context_results = await searcher.search_context(clusters)
-        
-        # Set data while still running so UI can show it expanding
-        state.steps[2].data = {
-            "results": context_results,
-            "sources_searched": ["GitHub", "GitHub Issues", "Slack"]
-        }
-        await manager.broadcast({"type": "step_data_ready", "step_id": "context-search", "state": state.model_dump()})
-        await asyncio.sleep(1.5)  # Pause so users can see the data
-        
-        state.steps[2].status = "completed"
-        state.steps[2].duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
-        await manager.broadcast({"type": "step_completed", "step_id": "context-search", "state": state.model_dump()})
-        await asyncio.sleep(0.3)
-        
-        # Step 4: Severity Analysis
-        state.current_step = 3
-        state.steps[3].status = "running"
-        await manager.broadcast({"type": "step_started", "step_id": "analysis", "state": state.model_dump()})
-        
-        start_time = datetime.utcnow()
-        analysis_results = await analyzer.analyze_errors(clusters, context_results)
-        
-        # Set data while still running so UI can show it expanding
-        state.steps[3].data = {
-            "analyses": analysis_results
-        }
-        state.steps[3].reasoning = analyzer.last_reasoning
-        await manager.broadcast({"type": "step_data_ready", "step_id": "analysis", "state": state.model_dump()})
-        await asyncio.sleep(1.5)  # Pause so users can see the data
-        
-        state.steps[3].status = "completed"
-        state.steps[3].duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
-        await manager.broadcast({"type": "step_completed", "step_id": "analysis", "state": state.model_dump()})
-        await asyncio.sleep(0.3)
-        
-        # Step 5: Alert Preview
-        state.current_step = 4
-        state.steps[4].status = "running"
-        await manager.broadcast({"type": "step_started", "step_id": "alert-preview", "state": state.model_dump()})
-        
-        start_time = datetime.utcnow()
-        
-        # Generate alert previews
-        alerts = []
-        for analysis in analysis_results:
-            actionable_title = _generate_actionable_title(analysis)
-            alert = {
-                "signature": analysis["signature"],
-                "severity": analysis["severity"],
-                "title": actionable_title,
-                "description": analysis.get("root_cause", ""),
-                "affected_orgs": analysis.get("affected_orgs", []),
-                "slack_preview": _generate_slack_preview(analysis),
-                "issue_preview": _generate_github_issue_preview(analysis),
-            }
-            alerts.append(alert)
-        
-        # Set data while still running so UI can show it expanding
-        state.steps[4].data = {
-            "alerts": alerts,
-            "total_alerts": len(alerts)
-        }
-        await manager.broadcast({"type": "step_data_ready", "step_id": "alert-preview", "state": state.model_dump()})
-        await asyncio.sleep(0.5)  # Brief pause before completing (this stays open)
-        
-        state.steps[4].status = "completed"
-        state.steps[4].duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
-        await manager.broadcast({"type": "step_completed", "step_id": "alert-preview", "state": state.model_dump()})
-        
-        # Pipeline complete
-        state.status = "completed"
-        state.completed_at = datetime.utcnow().isoformat()
-        await manager.broadcast({"type": "pipeline_completed", "state": state.model_dump()})
-        
-    except Exception as e:
-        logger.error(f"Pipeline error: {e}", exc_info=True)
-        state.status = "error"
-        if state.current_step < len(state.steps):
-            state.steps[state.current_step].status = "error"
-        await manager.broadcast({"type": "pipeline_error", "error": str(e), "state": state.model_dump()})
-    
-    return state
+# --- Removed old Pipeline Execution and ConnectionManager ---
 
 
 def _generate_actionable_title(analysis: Dict[str, Any]) -> str:
@@ -555,116 +320,107 @@ async def unmute_error(signature: str):
     }
 
 
-@app.post("/api/run")
-async def run_demo(config: PipelineConfig):
-    """
-    Start a pipeline run.
-    The actual execution happens via WebSocket for real-time updates.
-    """
-    # Run pipeline in background task
-    asyncio.create_task(run_pipeline(config))
-    return {"status": "started", "message": "Pipeline started. Connect to WebSocket for updates."}
+
 
 
 class RepoAnalyzeRequest(BaseModel):
     repo_url: str
     local_path: str | None = None
+    include_live_errors: bool = True
 
 
 @app.post("/api/analyze-repository")
 async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
-    """Start async repository analysis. Returns run_id. For remote repos, provide local_path to avoid cloning."""
+    """Start async repository analysis via UnifiedOrchestrator. Returns run_id."""
     run_id = create_run(req.repo_url)
     logger.info(f"[{run_id}] Analysis created for: {req.repo_url}")
 
     async def _bg():
         try:
             logger.info(f"[{run_id}] BG TASK STARTED")
-            
             loop = asyncio.get_event_loop()
 
             def _sync():
-                logger.info(f"[{run_id}] SYNC EXECUTOR RUNNING")
-                
-                # Create real progress callback that updates run state
+                logger.info(f"[{run_id}] Running UnifiedOrchestrator...")
+
+                # Map orchestrator steps → canonical stage IDs for SSE / partial state
+                step_to_stage = {
+                    'started':              'repository_ingestion',
+                    'ingesting_errors':     'repository_ingestion',
+                    'github_enriched':      'repository_ingestion',
+                    'github_sample':        'repository_ingestion',
+                    'scanning_repository':  'repository_ingestion',
+                    'scanned_files':        'repository_ingestion',
+                    'repository_classified':'workflow_discovery',
+                    'enriching_context':    'workflow_discovery',
+                    'workflows_extracted':  'workflow_discovery',
+                    'deployments_correlated':'deployment_analysis',
+                    'observability_checked': 'observability_analysis',
+                    'topology':             'topology_inference',
+                    'assessing_health':     'topology_propagation',
+                    'scored':               'operational_scoring',
+                    'temporal_analyzed':    'regression_risk_analysis',
+                    'live_errors_ingested': 'confidence_calibration',
+                    'generating_brief':     'final_operational_synthesis',
+                    'synthesis_complete':   'final_operational_synthesis',
+                    'completed':            'final_operational_synthesis',
+                    'error':                'final_operational_synthesis',
+                }
+
                 def progress_callback(step: str, payload: dict):
-                    """Progress callback that emits state transitions and partial updates."""
                     logger.info(f"[{run_id}] PROGRESS: step={step}")
-                    
-                    # Map steps to canonical stage IDs (matches repo_analyzer.py mapping)
-                    step_to_stage = {
-                        'started': 'repository_ingestion',
-                        'github_ingest_started': 'repository_ingestion',
-                        'github_sample': 'repository_ingestion',
-                        'scanned_files': 'repository_ingestion',
-                        'workflows_extracted': 'workflow_discovery',
-                        'deployments_correlated': 'deployment_analysis',
-                        'observability_checked': 'observability_analysis',
-                        'topology': 'topology_inference',
-                        'regression_checked': 'regression_risk_analysis',
-                        'scored': 'operational_scoring',
-                        'confidence_calibrated': 'confidence_calibration',
-                        'completed': 'final_operational_synthesis',
-                        'error': 'final_operational_synthesis',
-                    }
                     stage_id = step_to_stage.get(step, step)
-                    
-                    # Update run state based on step
+
+                    # State machine transitions
                     try:
                         if step == 'started':
-                            transition_run(run_id, 'INITIALIZING', f'Started {stage_id}')
-                        elif step in ('github_sample', 'scanned_files'):
+                            transition_run(run_id, 'INITIALIZING', 'Started')
+                        elif step in ('github_sample', 'scanned_files', 'ingesting_errors',
+                                      'github_enriched', 'scanning_repository'):
                             transition_run(run_id, 'INGESTING', f'Progress in {stage_id}')
-                        elif step == 'topology':
+                        elif step in ('topology', 'assessing_health', 'enriching_context',
+                                      'repository_classified'):
                             transition_run(run_id, 'ANALYZING', f'Progress in {stage_id}')
-                        elif step == 'scored':
+                        elif step in ('scored', 'temporal_analyzed', 'live_errors_ingested'):
                             transition_run(run_id, 'SCORING', f'Progress in {stage_id}')
-                        elif step == 'completed':
+                        elif step in ('generating_brief', 'synthesis_complete', 'completed'):
                             transition_run(run_id, 'FINALIZING', f'Completed {stage_id}')
                         elif step == 'error':
                             transition_run(run_id, 'FAILED', f'Error in {stage_id}')
-                    except Exception as e:
-                        logger.error(f"[{run_id}] Failed to transition state for step {step}: {e}")
-                    
-                    # Store partial update for progressive UI rendering
+                    except Exception as exc:
+                        logger.error(f"[{run_id}] State transition error at {step}: {exc}")
+
+                    # Store partial update for progressive SSE rendering
                     try:
                         set_partial_update(run_id, stage_id, {
                             'stage': stage_id,
                             'step': step,
-                            'progress': payload,
+                            'evidence': payload,
                         })
-                        logger.info(f"[{run_id}] Updated partial: {stage_id}")
-                    except Exception as e:
-                        logger.error(f"[{run_id}] Failed to set partial update for {stage_id}: {e}")
-                
+                    except Exception as exc:
+                        logger.error(f"[{run_id}] Partial update error at {stage_id}: {exc}")
+
                 try:
-                    logger.info(f"[{run_id}] Calling analyze_repository()...")
-                    result = analyze_repository(
-                        req.repo_url,
-                        local_path=req.local_path,
-                        progress_callback=progress_callback,
+                    from pipeline.unified_orchestrator import UnifiedOrchestrator
+                    orch = UnifiedOrchestrator()
+                    result = orch.run(
+                        repo_url=req.repo_url,
                         run_id=run_id,
+                        progress_callback=progress_callback,
+                        local_path=req.local_path,
                     )
-                    logger.info(f"[{run_id}] analyze_repository() completed.")
-                    logger.info(f"[{run_id}] Result: scanned={result.get('scanned')}, error={result.get('error')}, evidence_keys={list(result.get('evidence', {}).keys())}")
-                    logger.info(f"[{run_id}] Scores: {result.get('scores')}")
-                    
-                    # Finalize run with result
-                    try:
-                        finalize_run(run_id, result)
-                        logger.info(f"[{run_id}] Run finalized successfully")
-                    except Exception as e:
-                        logger.error(f"[{run_id}] Failed to finalize run: {e}")
-                    
-                except Exception as e:
-                    logger.exception(f"[{run_id}] Exception in _sync(): {e}")
+                    logger.info(f"[{run_id}] Orchestrator completed successfully.")
+                    finalize_run(run_id, result)
+                    logger.info(f"[{run_id}] Run finalized.")
+                except Exception as exc:
+                    logger.exception(f"[{run_id}] Orchestrator exception: {exc}")
                     raise
 
             await loop.run_in_executor(None, _sync)
             logger.info(f"[{run_id}] BG TASK COMPLETED SUCCESSFULLY")
-        except Exception as e:
-            logger.error(f"[{run_id}] BG TASK FAILED: {e}", exc_info=True)
-            fail_run(run_id, str(e))
+        except Exception as exc:
+            logger.error(f"[{run_id}] BG TASK FAILED: {exc}", exc_info=True)
+            fail_run(run_id, str(exc))
 
     asyncio.create_task(_bg())
     return {"run_id": run_id, "status": "started"}
@@ -737,37 +493,7 @@ async def stream_analysis(run_id: str):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.websocket("/ws/pipeline")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time pipeline updates.
-    
-    Messages sent:
-    - pipeline_started: Pipeline execution has begun
-    - step_started: A step has started processing
-    - step_completed: A step has finished
-    - pipeline_completed: All steps finished successfully
-    - pipeline_error: An error occurred
-    """
-    await manager.connect(websocket)
-    try:
-        while True:
-            # Keep connection alive and handle incoming messages
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            if message.get("type") == "run":
-                # Client requested to run the pipeline
-                config = PipelineConfig(**message.get("config", {}))
-                asyncio.create_task(run_pipeline(config))
-            elif message.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
-                
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
+
 
 
 if __name__ == "__main__":

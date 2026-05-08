@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import Icons from '@/lib/icons'
+import { ChevronDown, ChevronRight, ArrowRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -1006,12 +1007,7 @@ function AlertPreviewData({ data }: { data: Record<string, unknown> }) {
     issue_preview: { title: string; description: string; labels: string[] }
   }>
 
-  const severityEmoji: Record<string, string> = {
-    S1: '',
-    S2: '',
-    S3: '',
-    S4: '',
-  }
+
 
   const priorityColors: Record<string, string> = {
     S1: 'bg-red-500',

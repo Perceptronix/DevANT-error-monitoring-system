@@ -18,6 +18,8 @@ from .operational_scoring import OperationalScoringEngine
 from .github_ingestor import GitHubIngestor
 from .evidence_engine import EvidenceEngine
 from .analysis_state import transition_run, finalize_run, fail_run, get_run_snapshot, set_partial_update
+from samples import get_sample_errors
+from pipeline import ErrorClusterer
 
 # Import SignalFusionEngine + TopologyPropagationEngine - sys.path must include backend dir
 import sys
@@ -263,13 +265,15 @@ async def _concurrent_extraction(path: Path) -> Dict[str, Any]:
     return merged
 
 
-def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None, run_id: Optional[str] = None) -> Dict[str, Any]:
+def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None, run_id: Optional[str] = None, include_live_errors: bool = True) -> Dict[str, Any]:
     """Analyze repository for operational metadata.
 
     Args:
         repo_url: user-provided repo URL (https or local path)
         local_path: optional explicit local path to analyze (preferred)
         progress_callback: optional callback(step_name, partial_result) used to stream progress
+        run_id: Analysis run identifier
+        include_live_errors: Whether to ingest live operational errors
 
     Returns:
         result dict with evidence and flags
@@ -440,6 +444,24 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
                 'prometheus': evidence.get('prometheus', False),
                 'otel': evidence.get('otel', False),
             })
+            
+            if include_live_errors:
+                try:
+                    gh_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(gh_loop)
+                    errors = get_sample_errors(include_extended=True)
+                    clusterer = ErrorClusterer()
+                    clusters = gh_loop.run_until_complete(clusterer.cluster_errors(errors))
+                    gh_loop.close()
+                    evidence['live_errors'] = clusters
+                    progress('live_errors_ingested', {
+                        'raw_errors': len(errors),
+                        'clusters': clusters
+                    })
+                except Exception as e:
+                    logger.error(f"Live error ingestion failed in GH flow: {e}")
+                    evidence['live_errors'] = []
+
             # Build topology from sampled manifests minimal
             topology = TopologyExtractor().extract_from_local_path(path) if path else {'services': [], 'edges': []}
             
@@ -586,19 +608,15 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             result.update({'scanned': True, 'evidence': evidence, 'topology': topology, 'scores': scores})
             
             # AI Synthesis Layer
-            try:
-                from pipeline.synthesis_engine import SynthesisEngine
-                synth_engine = SynthesisEngine()
-                synthesis = synth_engine.synthesize(
-                    evidence=evidence,
-                    topology=topology,
-                    scores=scores,
-                    propagation=evidence.get('propagation', {})
-                )
-                result['synthesis'] = synthesis
-            except Exception as e:
-                logger.error(f"Synthesis integration failed: {e}")
-                result['synthesis'] = None
+            from pipeline.synthesis_engine import SynthesisEngine
+            synth_engine = SynthesisEngine()
+            synthesis = synth_engine.synthesize(
+                evidence=evidence,
+                topology=topology,
+                scores=scores,
+                propagation=evidence.get('propagation', {})
+            )
+            result['synthesis'] = synthesis
             
             progress('completed', {'result_summary': {'services': len(evidence.get('services', [])), 'scores': scores, 'synthesis': result.get('synthesis')}})
             # finalize run deterministically
@@ -645,7 +663,30 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        concurrent_evidence = loop.run_until_complete(_concurrent_extraction(path))
+        
+        async def run_all():
+            evidence_task = _concurrent_extraction(path)
+            if include_live_errors:
+                errors = get_sample_errors(include_extended=True)
+                clusterer = ErrorClusterer()
+                clusters_task = clusterer.cluster_errors(errors)
+                evidence, clusters = await asyncio.gather(evidence_task, clusters_task, return_exceptions=True)
+                if isinstance(evidence, Exception):
+                    raise evidence
+                if isinstance(clusters, Exception):
+                    logger.error(f"Live error ingestion failed: {clusters}")
+                    evidence['live_errors'] = []
+                else:
+                    evidence['live_errors'] = clusters
+                    progress('live_errors_ingested', {
+                        'raw_errors': len(errors),
+                        'clusters': clusters
+                    })
+                return evidence
+            else:
+                return await evidence_task
+                
+        concurrent_evidence = loop.run_until_complete(run_all())
         loop.close()
     except Exception as e:
         logger.exception(f"Concurrent extraction failed: {e}")
@@ -875,7 +916,18 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
     result['topology'] = topology
     result['scores'] = scores
 
-    progress('completed', {'result_summary': {'services': len(evidence['services']), 'scores': scores}})
+    # AI Synthesis Layer
+    from pipeline.synthesis_engine import SynthesisEngine
+    synth_engine = SynthesisEngine()
+    synthesis = synth_engine.synthesize(
+        evidence=evidence,
+        topology=topology,
+        scores=scores,
+        propagation=evidence.get('propagation', {})
+    )
+    result['synthesis'] = synthesis
+
+    progress('completed', {'result_summary': {'services': len(evidence['services']), 'scores': scores, 'synthesis': result.get('synthesis')}})
     try:
         if run_id:
             finalize_run(run_id, result)

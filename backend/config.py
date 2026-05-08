@@ -200,7 +200,7 @@ class Config:
             # Groq (required for semantic processing)
             groq=GroqConfig(
                 api_key=os.getenv("GROQ_API_KEY"),
-                model=os.getenv("GROQ_MODEL", "llama3-70b-8192"),
+                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             ),
             
             # ChromaDB (always configured locally)

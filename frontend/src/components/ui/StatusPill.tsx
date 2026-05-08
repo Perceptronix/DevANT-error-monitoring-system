@@ -1,4 +1,4 @@
-import React from 'react'
+
 
 export default function StatusPill({ status }: { status: 'healthy' | 'attention' | 'critical' | 'analyzing' | 'unknown' }) {
   const map: Record<string, { dot: string; labelClass?: string }> = {

@@ -30,7 +30,6 @@ export default function PipelineTimeline({ snapshot }: Props) {
     const partial = snapshot?.partial || snapshot?.result_snapshot?.partial || {}
     return STAGES.map(({ key, name }) => {
       // support both snake_case and Title Case variants from backend just in case
-      const titleKey = name.replace(/ /g, ' ')
       const originalTitleKey = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
       
       const entry = partial[key] || partial[originalTitleKey] || null
