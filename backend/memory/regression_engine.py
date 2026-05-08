@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 
 from memory.regression_memory import RegressionMemoryGraph, RegressionIncident, RegressionMatch
 from memory.stacktrace_normalizer import StacktraceNormalizer
+from memory.operational_fingerprint import OperationalFingerprintEngine
 from core.normalization import normalize_timestamp
+from core.signal_fusion import SignalFusionEngine, SignalType
 
 
 class RegressionIntelligenceEngine:
@@ -24,6 +26,7 @@ class RegressionIntelligenceEngine:
     def __init__(self):
         self.memory_graph = RegressionMemoryGraph()
         self.normalizer = StacktraceNormalizer()
+        self.fingerprint_engine = OperationalFingerprintEngine()
 
     def analyze_incident(
         self,
@@ -60,7 +63,7 @@ class RegressionIntelligenceEngine:
             {
                 "service": service,
                 "error_signature": error_signature,
-                "stacktrace": stacktrace,
+                "stacktrace": stacktrace,  # This is already extracted above
                 "deployment_id": deployment_id,
                 "deployment_time": deployment_time,
                 "timestamp": timestamp,
@@ -99,8 +102,13 @@ class RegressionIntelligenceEngine:
             },
             "root_cause_hint": root_cause_hint,
             "remediation_hint": remediation_hint,
-            "recurrence_risk": "HIGH" if regression_match.confidence >= 0.8 else "MEDIUM" if regression_match.confidence >= 0.6 else "LOW",
+            "recurrence_risk": "HIGH" if regression_match.confidence >= 0.75 else "MEDIUM" if regression_match.confidence >= 0.5 else "LOW",
         }
+
+        # Add signal fusion analysis if regression detected
+        if regression_match.is_regression and regression_match.matched_incident_id:
+            fusion_analysis = self._compute_evidence_grounded_confidence(incident, context or {})
+            analysis["signal_fusion"] = fusion_analysis
 
         return analysis
 
@@ -171,6 +179,83 @@ class RegressionIntelligenceEngine:
             "total_reoccurrences": total_reoccurrences,
             "memory_size": len(self.memory_graph.incidents),
             "services_tracked": len(set(inc.service for inc in self.memory_graph.incidents.values())),
+        }
+
+    def _compute_evidence_grounded_confidence(
+        self,
+        incident: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Compute evidence-grounded confidence from multi-signal convergence.
+
+        Uses signal fusion to combine:
+        - Regression similarity (stacktrace, semantics)
+        - Temporal correlation (deployment, recurrence window)
+        - Telemetry convergence (same metrics degrading)
+        - Propagation alignment (same service path failing)
+        - Topology consistency (same dependencies affected)
+        """
+        fusion = SignalFusionEngine()
+
+        # Signal 1: Regression similarity
+        try:
+            new_fp = self.fingerprint_engine.fingerprint_incident(incident)
+            if new_fp.canonical_failure_class != "UNKNOWN":
+                # Fingerprint-based similarity is strong evidence
+                fusion.add_signal(
+                    SignalType.REGRESSION_SIMILARITY,
+                    0.8,  # Strong if fingerprint classified
+                    "operational_fingerprint",
+                )
+        except Exception:
+            pass
+
+        # Signal 2: Temporal correlation (from prior detect_regression)
+        temporal_sim = context.get("temporal_proximity", 0.0)
+        if temporal_sim > 0:
+            fusion.add_signal(
+                SignalType.TEMPORAL_CORRELATION,
+                temporal_sim,
+                "temporal_recurrence_window",
+            )
+
+        # Signal 3: Telemetry convergence
+        metrics_overlap = context.get("metrics_overlap", 0.0)
+        if metrics_overlap > 0:
+            fusion.add_signal(
+                SignalType.TELEMETRY_CONVERGENCE,
+                metrics_overlap,
+                "metric_anomaly_overlap",
+            )
+
+        # Signal 4: Propagation alignment
+        propagation_sim = context.get("propagation_alignment", 0.0)
+        if propagation_sim > 0:
+            fusion.add_signal(
+                SignalType.PROPAGATION_ALIGNMENT,
+                propagation_sim,
+                "propagation_path_consistency",
+            )
+
+        # Signal 5: Anomaly alignment (infer from metrics)
+        anomalies = incident.get("metrics_anomalies") or context.get("metrics_anomalies") or []
+        if len(anomalies) >= 2:
+            fusion.add_signal(
+                SignalType.ANOMALY_ALIGNMENT,
+                0.6,
+                "multi_metric_anomaly",
+            )
+
+        # Fuse signals
+        result = fusion.fuse()
+
+        return {
+            "evidence_confidence": result["confidence"],
+            "signal_count": result["signal_count"],
+            "convergence_score": result["convergence_score"],
+            "uncertainty": result["uncertainty"],
+            "sparse_evidence": result["sparse_evidence"],
+            "reasoning": result["reason"],
         }
 
 

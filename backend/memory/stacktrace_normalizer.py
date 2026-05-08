@@ -46,6 +46,14 @@ class StacktraceNormalizer:
         "leak", "exhausted", "exceeded", "limit", "quota", "throttle",
         "backoff", "circuit", "breaker", "fallback", "circuit-break",
         "rollback", "deployment", "rollout", "canary", "blue-green",
+        # Common error types
+        "attributeerror", "typeerror", "keyerror", "valueerror",
+        "connectionerror", "timeouterror", "ioerror", "oserror",
+        "exception", "error", "fault", "failed", "failure",
+        # Config-related
+        "config", "configuration", "setting", "property",
+        # Null/None-related
+        "none", "null", "nil", "undefined",
     }
 
     def normalize(self, stacktrace: str) -> str:

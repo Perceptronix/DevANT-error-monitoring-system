@@ -6,6 +6,12 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Chroma runtime storage
+backend/data/chroma/
+*.sqlite3
+*.bin
+
+
 .venv/
 venv/
 env/
