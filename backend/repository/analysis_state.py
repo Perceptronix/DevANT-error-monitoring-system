@@ -72,3 +72,21 @@ def get_run_snapshot(run_id: str) -> Dict[str, Any]:
         if rec is None:
             return {'status': 'not_found'}
         return copy.deepcopy(rec)
+
+
+def set_partial_update(run_id: str, step: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomic partial update for progressive UI rendering."""
+    def _up(old):
+        new = copy.deepcopy(old)
+        partial = copy.deepcopy(new.get('partial', {}))
+        partial[step] = copy.deepcopy(payload)
+        new['partial'] = partial
+        return new
+    return _atomic_update(run_id, _up)
+
+
+def list_runs(limit: int = 20):
+    with _runs_lock:
+        items = list(_runs.values())
+        items.sort(key=lambda item: item.get('transitions', [{}])[-1].get('at', ''), reverse=True)
+        return copy.deepcopy(items[:limit])

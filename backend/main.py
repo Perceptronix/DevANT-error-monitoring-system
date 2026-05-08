@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # Load environment variables first
@@ -33,8 +34,13 @@ from samples import get_sample_errors
 from pipeline import ErrorClusterer, ContextSearcher, ErrorAnalyzer, get_action_executor
 from core.scoring import severity_priority
 from repository.repo_analyzer import analyze_repository
-from repository.analysis_state import create_run, set_run_result, set_run_error, get_run
-from pydantic import BaseModel
+from repository.analysis_state import (
+    create_run,
+    fail_run,
+    get_run_snapshot,
+    cancel_run,
+    list_runs,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -569,13 +575,11 @@ async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
         try:
             # progress callback simple logger
             def progress(step, payload):
-                # could broadcast over WS in future
-                pass
+                return None
 
-            result = analyze_repository(req.repo_url, local_path=req.local_path, progress_callback=progress)
-            set_run_result(run_id, result)
+            analyze_repository(req.repo_url, local_path=req.local_path, progress_callback=progress, run_id=run_id)
         except Exception as e:
-            set_run_error(run_id, str(e))
+            fail_run(run_id, str(e))
 
     asyncio.create_task(_bg())
     return {"run_id": run_id, "status": "started"}
@@ -583,7 +587,57 @@ async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
 
 @app.get("/api/analyze-repository/{run_id}")
 async def get_analysis(run_id: str):
-    return get_run(run_id)
+    return get_run_snapshot(run_id)
+
+
+@app.get("/api/analyze-repository")
+async def get_recent_analyses(limit: int = 20):
+    return {"runs": list_runs(limit=limit)}
+
+
+@app.post("/api/analyze-repository/{run_id}/cancel")
+async def cancel_analysis(run_id: str):
+    snap = get_run_snapshot(run_id)
+    if snap.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="run_id not found")
+    try:
+        cancel_run(run_id, "user_request")
+    except Exception:
+        # terminal states return current snapshot
+        pass
+    return get_run_snapshot(run_id)
+
+
+@app.get("/api/analyze-repository/{run_id}/stream")
+async def stream_analysis(run_id: str):
+    """SSE stream for analysis run snapshots. Emits only on state changes."""
+
+    async def event_generator():
+        last_sig = None
+        while True:
+            snap = get_run_snapshot(run_id)
+            if snap.get("status") == "not_found":
+                yield "event: error\ndata: {\"error\":\"not_found\"}\n\n"
+                break
+
+            sig = json.dumps({
+                "state": snap.get("state"),
+                "transitions": len(snap.get("transitions", [])),
+                "partial_keys": sorted(list((snap.get("partial") or {}).keys())),
+                "result": bool(snap.get("result_snapshot")),
+            }, sort_keys=True)
+
+            if sig != last_sig:
+                payload = json.dumps(snap)
+                yield f"event: update\ndata: {payload}\n\n"
+                last_sig = sig
+
+            if snap.get("state") in ("COMPLETED", "FAILED", "CANCELLED"):
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.websocket("/ws/pipeline")

@@ -13,7 +13,7 @@ from .topology_extractor import TopologyExtractor
 from .operational_scoring import OperationalScoringEngine
 from .github_ingestor import GitHubIngestor
 from .evidence_engine import EvidenceEngine
-from .analysis_state import create_run, transition_run, finalize_run, fail_run, get_run_snapshot
+from .analysis_state import transition_run, finalize_run, fail_run, get_run_snapshot, set_partial_update
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def _read_file_safe(path: Path, max_bytes: int = 16_384) -> str:
         return ''
 
 
-def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None, run_id: Optional[str] = None) -> Dict[str, Any]:
     """Analyze repository for operational metadata.
 
     Args:
@@ -47,19 +47,23 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
         'scores': {},
     }
 
-    # create run record if not provided
-    run_id = None
-    try:
-        run_id = create_run(repo_url)
-    except Exception:
-        run_id = None
-
     def progress(step: str, payload: Dict[str, Any]):
+        # cancellation safety: no processing after cancel
+        if run_id:
+            snap = get_run_snapshot(run_id)
+            if snap.get('state') == 'CANCELLED':
+                raise RuntimeError('cancelled')
+
         if progress_callback:
             try:
                 progress_callback(step, payload)
             except Exception:
                 logger.exception('progress callback failed')
+        if run_id:
+            try:
+                set_partial_update(run_id, step, payload)
+            except Exception:
+                pass
         # also update run state transitions for deterministic lifecycle
         if run_id:
             try:
@@ -67,8 +71,10 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
                     transition_run(run_id, 'INITIALIZING')
                 elif step == 'github_sample' or step == 'scanned_files':
                     transition_run(run_id, 'INGESTING')
-                elif step == 'topology' or step == 'scored':
+                elif step == 'topology':
                     transition_run(run_id, 'ANALYZING')
+                elif step == 'scored':
+                    transition_run(run_id, 'SCORING')
                 elif step == 'completed':
                     transition_run(run_id, 'FINALIZING')
             except Exception:
@@ -111,9 +117,10 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             topology = TopologyExtractor().extract_from_local_path(path) if path else {'services': [], 'edges': []}
             # Evidence engine deeper evaluation
             ee = EvidenceEngine()
-            ev_summary = ee.evaluate(evidence, topology)
+            _ = ee.evaluate(evidence, topology)
             scoring_engine = OperationalScoringEngine()
             scores = scoring_engine.score_from_evidence(evidence, topology)
+            progress('scored', {'scores': scores})
             result.update({'scanned': True, 'evidence': evidence, 'topology': topology, 'scores': scores})
             progress('completed', {'result_summary': {'services': len(evidence.get('services', [])), 'scores': scores}})
             # finalize run deterministically
@@ -123,9 +130,11 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             except Exception:
                 pass
             # return immutable snapshot
-            import json
             return json.loads(json.dumps(result))
         except Exception as e:
+            if str(e) == 'cancelled':
+                result['error'] = 'cancelled'
+                return json.loads(json.dumps(result))
             result['error'] = f'github_ingest_failed: {e}'
             progress('error', {'error': result['error']})
             return result
