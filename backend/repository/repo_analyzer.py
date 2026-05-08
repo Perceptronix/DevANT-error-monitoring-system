@@ -9,6 +9,7 @@ import os
 import json
 from pathlib import Path
 import logging
+from datetime import datetime
 from .topology_extractor import TopologyExtractor
 from .operational_scoring import OperationalScoringEngine
 from .github_ingestor import GitHubIngestor
@@ -47,7 +48,54 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
         'scores': {},
     }
 
+    # monotonic sequence counter for emitted stage events
+    seq_counter = 0
+
     def progress(step: str, payload: Dict[str, Any]):
+        nonlocal seq_counter
+        seq_counter += 1
+        ts = datetime.utcnow().isoformat()
+        # canonical stage mapping
+        step_to_stage = {
+            'started': 'repository_ingestion',
+            'github_ingest_started': 'repository_ingestion',
+            'github_sample': 'repository_ingestion',
+            'scanned_files': 'repository_ingestion',
+            'topology': 'topology_inference',
+            'scored': 'operational_scoring',
+            'completed': 'final_operational_synthesis',
+            'error': 'final_operational_synthesis',
+        }
+        stage_id = step_to_stage.get(step, step)
+
+        # derive event kind and status
+        if step in ('started', 'github_ingest_started'):
+            event_kind = 'stage_started'
+            status = 'running'
+        elif step in ('github_sample', 'scanned_files', 'topology', 'scored'):
+            event_kind = 'stage_progress'
+            status = 'partial'
+        elif step == 'completed':
+            event_kind = 'stage_completed'
+            status = 'completed'
+        elif step == 'error':
+            event_kind = 'stage_failed'
+            status = 'failed'
+        else:
+            event_kind = 'stage_progress'
+            status = 'partial'
+
+        event_payload = {
+            'seq': seq_counter,
+            'event': event_kind,
+            'stage': stage_id,
+            'status': status,
+            'evidence': payload,
+            'confidence': payload.get('confidence') if isinstance(payload, dict) else None,
+            'timestamp': ts,
+            'partial_result': payload,
+        }
+
         # cancellation safety: no processing after cancel
         if run_id:
             snap = get_run_snapshot(run_id)
@@ -56,12 +104,25 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
 
         if progress_callback:
             try:
+                # emit generic progress callback for legacy handlers
                 progress_callback(step, payload)
+                # also emit canonical stage event when available
+                try:
+                    progress_callback('stage_event', event_payload)
+                except Exception:
+                    pass
             except Exception:
                 logger.exception('progress callback failed')
         if run_id:
             try:
-                set_partial_update(run_id, step, payload)
+                # store canonical partial by stage id for frontend consumption
+                set_partial_update(run_id, stage_id, {
+                    'state': status.upper() if isinstance(status, str) else status,
+                    'progress': payload.get('progress') if isinstance(payload, dict) and 'progress' in payload else None,
+                    'evidence': payload.get('evidence') if isinstance(payload, dict) and 'evidence' in payload else payload,
+                    'confidence': payload.get('confidence') if isinstance(payload, dict) else None,
+                    'last_event': event_payload,
+                })
             except Exception:
                 pass
         # also update run state transitions for deterministic lifecycle

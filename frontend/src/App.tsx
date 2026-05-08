@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertTriangle, Network, Search, Square, Wifi, WifiOff } from 'lucide-react'
+import RepositoryPipeline from '@/components/RepositoryPipeline'
+import PipelineTimeline from '@/components/PipelineTimeline'
+import useSSE from '@/hooks/useSSE'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { isTerminalState, shouldApplySnapshot } from '@/lib/runSnapshot'
@@ -54,7 +57,8 @@ export default function App() {
   const [recentRuns, setRecentRuns] = useState<RunSnapshot[]>([])
   const [isStarting, setIsStarting] = useState(false)
   const [streamConnected, setStreamConnected] = useState(false)
-  const sourceRef = useRef<EventSource | null>(null)
+  const [lastEventRaw, setLastEventRaw] = useState<string | null>(null)
+  const [eventLog, setEventLog] = useState<Array<{ t: string; data: string }>>([])
   const latestTransitionCountRef = useRef<number>(0)
 
   const refreshRecent = useCallback(async () => {
@@ -72,11 +76,15 @@ export default function App() {
     void refreshRecent()
   }, [refreshRecent])
 
+  const { connected: hookConnected, lastRaw: hookLastRaw, eventLog: hookEventLog, close: hookClose } = useSSE(activeRunId ? `/api/analyze-repository/${activeRunId}/stream` : undefined, (parsed) => {
+    // incoming snapshot from hook
+    applySnapshot(parsed)
+  })
+
   const closeStream = useCallback(() => {
-    sourceRef.current?.close()
-    sourceRef.current = null
+    hookClose()
     setStreamConnected(false)
-  }, [])
+  }, [hookClose])
 
   const applySnapshot = useCallback((incoming: RunSnapshot) => {
     const count = incoming.transitions?.length ?? 0
@@ -99,27 +107,19 @@ export default function App() {
     }
   }, [activeSnapshot?.state, closeStream, refreshRecent])
 
-  const connectStream = useCallback((runId: string) => {
-    closeStream()
-    const source = new EventSource(`/api/analyze-repository/${runId}/stream`)
-    sourceRef.current = source
-
-    source.addEventListener('open', () => {
-      setStreamConnected(true)
-    })
-
-    source.addEventListener('update', (event) => {
-      const data = JSON.parse((event as MessageEvent).data) as RunSnapshot
-      applySnapshot(data)
-    })
-
-    source.addEventListener('error', () => {
-      setStreamConnected(false)
-      // EventSource auto-reconnects; keep instance alive unless terminal state
-    })
-  }, [applySnapshot, closeStream])
+  const connectStream = useCallback(() => {
+    // no-op: useSSE auto-connects when activeRunId set
+    setStreamConnected(true)
+  }, [])
 
   useEffect(() => () => closeStream(), [closeStream])
+
+  useEffect(() => {
+    // mirror hook-connected into UI badge and debug panel
+    setStreamConnected(Boolean(hookConnected))
+    if (hookLastRaw) setLastEventRaw(hookLastRaw)
+    if (hookEventLog && hookEventLog.length > 0) setEventLog(hookEventLog as any)
+  }, [hookConnected, hookLastRaw, hookEventLog])
 
   const startAnalysis = useCallback(async () => {
     if (!repoUrl.trim()) return
@@ -136,7 +136,7 @@ export default function App() {
       if (!res.ok) throw new Error('start_failed')
       const data = await res.json() as { run_id: string }
       setActiveRunId(data.run_id)
-      connectStream(data.run_id)
+      connectStream()
       void refreshRecent()
     } finally {
       setIsStarting(false)
@@ -211,6 +211,23 @@ export default function App() {
             {activeRunId && <Badge variant="outline">Run: {activeRunId.slice(0, 8)}...</Badge>}
             <Badge variant="outline">Partial render: enabled</Badge>
             <Badge variant="outline">Uncertainty-first UI</Badge>
+          </div>
+        </section>
+
+        <RepositoryPipeline snapshot={activeSnapshot} />
+
+        <PipelineTimeline snapshot={activeSnapshot} />
+
+        <section className="rounded-xl border border-border bg-card p-4 space-y-3">
+          <h2 className="font-semibold">Stream Debug</h2>
+            <div className="text-xs text-muted-foreground">Last event type: -</div>
+            <div className="text-xs text-muted-foreground">Last raw payload:</div>
+          <pre className="max-h-40 overflow-auto text-[11px] p-2 bg-muted/5 rounded">{lastEventRaw || '-'}</pre>
+          <div className="text-xs font-medium">Recent events</div>
+          <div className="max-h-40 overflow-auto text-xs">
+            {eventLog.map((e, i) => (
+              <div key={i} className="py-1 border-b border-border">[{e.t}] {e.data.slice(0, 200)}{e.data.length > 200 ? '…' : ''}</div>
+            ))}
           </div>
         </section>
 
@@ -289,7 +306,7 @@ export default function App() {
                   latestTransitionCountRef.current = run.transitions?.length ?? 0
                   setActiveSnapshot(run)
                   if (!isTerminalState(run.state)) {
-                    connectStream(run.run_id)
+                    connectStream()
                   }
                 }}
               >
