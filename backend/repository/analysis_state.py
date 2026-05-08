@@ -1,11 +1,12 @@
-"""
-Simple in-memory analysis run state store. Not persistent. Suitable for demo/testing.
+"""Analysis run state store with JSON persistence.
 """
 from typing import Dict, Any
 import uuid
 import threading
 import asyncio
 import copy
+import json
+from pathlib import Path
 from .job_state_machine import initial_job_record, transition, finalize_with_result, fail_with_error, cancel
 
 
@@ -13,12 +14,45 @@ _runs: Dict[str, Dict[str, Any]] = {}
 _runs_lock = threading.Lock()
 _async_lock = asyncio.Lock()
 
+STATE_FILE = Path("data/analysis_runs.json")
+_file_lock = threading.Lock()
+
+
+def _load_from_disk():
+    """Load run state from disk on startup."""
+    global _runs
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text())
+            with _runs_lock:
+                _runs = data.get("runs", {})
+    except Exception:
+        pass
+
+
+def _save_to_disk():
+    """Save run state to disk snapshot."""
+    with _file_lock:
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with _runs_lock:
+                snapshot = dict(_runs)
+            STATE_FILE.write_text(
+                json.dumps({"runs": snapshot}, default=str)
+            )
+        except Exception:
+            pass
+
+
+_load_from_disk()
+
 
 def create_run(repo_url: str) -> str:
     run_id = str(uuid.uuid4())
     rec = initial_job_record(run_id, repo_url)
     with _runs_lock:
         _runs[run_id] = rec
+    _save_to_disk()
     return run_id
 
 
@@ -31,7 +65,9 @@ def _atomic_update(run_id: str, updater):
         new = updater(old)
         # store new record immutably (copy)
         _runs[run_id] = copy.deepcopy(new)
-        return copy.deepcopy(new)
+        result = copy.deepcopy(new)
+    _save_to_disk()
+    return result
 
 
 async def async_atomic_update(run_id: str, updater):

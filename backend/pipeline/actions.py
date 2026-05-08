@@ -1,9 +1,9 @@
 """
-Execute actions: create/update Linear tickets, post Slack alerts, update state.
+Execute actions: create/update GitHub issues, post Slack alerts, update state.
 
 This module orchestrates all external actions after analysis is complete.
 Actions are based on error status (NEW, REGRESSION, ONGOING) and whether
-a relevant ticket already exists.
+a relevant issue already exists.
 """
 import logging
 from datetime import datetime
@@ -11,8 +11,7 @@ from typing import Dict, Any, List, Optional
 
 from schemas import AnalyzedError, ErrorResult, LinearTicketResult, SlackMessageResult
 from state import get_state_manager
-from clients import get_linear_client, get_slack_client
-from core.scoring import severity_priority
+from clients import get_github_issues_client, get_slack_client
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +21,14 @@ class ActionExecutor:
     Executes alerting actions based on analysis results.
     
     Handles:
-    - Linear ticket creation/update/commenting
+    - GitHub issue creation/update/commenting
     - Slack alert posting
     - State updates
     """
     
     def __init__(self):
         self.state = get_state_manager()
-        self.linear = get_linear_client()
+        self.issues = get_github_issues_client()
         self.slack = get_slack_client()
     
     async def execute(self, error: AnalyzedError) -> ErrorResult:
@@ -38,10 +37,10 @@ class ActionExecutor:
         
         Actions depend on status and suppression:
         - If should_alert is False: Skip alerting, just update state
-        - NEW: Create Linear ticket + Post Slack alert
-        - REGRESSION: Reopen/comment on Linear + Post Slack alert
-        - ONGOING (with ticket): Add comment to Linear + Thread reply in Slack
-        - ONGOING (no ticket): Create Linear ticket + Post Slack alert
+        - NEW: Create GitHub issue + Post Slack alert
+        - REGRESSION: Reopen/comment on GitHub issue + Post Slack alert
+        - ONGOING (with issue): Add comment to GitHub issue + Thread reply in Slack
+        - ONGOING (no issue): Create GitHub issue + Post Slack alert
         
         Args:
             error: Analyzed error with all context
@@ -68,10 +67,10 @@ class ActionExecutor:
                 "last_severity": error.severity,
             })
         else:
-            # Execute Linear actions
-            linear_result = await self._execute_linear_actions(error)
+            # Execute GitHub issue actions
+            linear_result = await self._execute_issue_actions(error)
             if linear_result:
-                actions_taken.append(f"linear_{linear_result.action}")
+                actions_taken.append(f"issue_{linear_result.action}")
             
             # Execute Slack actions
             slack_result = await self._execute_slack_actions(error, linear_result)
@@ -122,20 +121,19 @@ class ActionExecutor:
             actions_taken=actions_taken,
         )
     
-    async def _execute_linear_actions(self, error: AnalyzedError) -> Optional[LinearTicketResult]:
-        """Execute Linear ticket actions."""
+    async def _execute_issue_actions(self, error: AnalyzedError) -> Optional[LinearTicketResult]:
+        """Execute GitHub issue actions."""
         signature = error.signature
         status = error.status
         prev_state = error.previous_state
         
-        # NEW or ONGOING without a relevant ticket: Create new ticket
+        # NEW or ONGOING without a relevant issue: Create new issue
         if status == "NEW" or (status == "ONGOING" and not error.has_relevant_ticket):
-            logger.info(f"[{signature[:30]}...] Creating new Linear ticket")
+            logger.info(f"[{signature[:30]}...] Creating new GitHub issue")
             
-            ticket = await self.linear.create_issue(
+            ticket = await self.issues.create_issue(
                 title=f"[{error.severity}] {signature[:80]}",
-                description=self._build_ticket_description(error),
-                priority=severity_priority(error.severity),
+                body=self._build_ticket_description(error),
                 labels=["bug", "monitoring", error.severity.lower()],
             )
             
@@ -149,9 +147,9 @@ class ActionExecutor:
                 is_preview=ticket.is_preview,
             )
         
-        # REGRESSION: Reopen/comment on existing ticket
+        # REGRESSION: Reopen/comment on existing issue
         elif status == "REGRESSION" and prev_state.linear_issue_id:
-            logger.info(f"[{signature[:30]}...] Reopening ticket for regression: {prev_state.linear_issue_id}")
+            logger.info(f"[{signature[:30]}...] Reopening issue for regression: {prev_state.linear_issue_id}")
             
             # Add comment about regression
             comment = f"""## Regression Detected
@@ -165,35 +163,43 @@ This error has reoccurred after being marked as resolved.
 
 **Root Cause:** {error.root_cause or 'Under investigation'}
 """
-            await self.linear.add_comment(prev_state.linear_issue_id, comment)
+            await self.issues.comment_on_issue(prev_state.linear_issue_id, comment)
+            await self.issues.update_issue(
+                prev_state.linear_issue_id,
+                labels=["bug", "monitoring", error.severity.lower(), "regression"],
+            )
             
             return LinearTicketResult(
                 id=prev_state.linear_issue_id,
                 identifier=prev_state.linear_issue_id[:8],
                 title=f"[{error.severity}] {signature[:80]}",
-                url=prev_state.linear_issue_url or f"https://linear.app/issue/{prev_state.linear_issue_id}",
-                status="Reopened",
+                url=prev_state.linear_issue_url or f"https://github.com/{self.issues.owner}/{self.issues.repo}/issues/{prev_state.linear_issue_id}",
+                status="Open",
                 action="reopened",
-                is_preview=not self.linear.is_configured,
+                is_preview=False,
             )
         
-        # ONGOING with ticket: Add comment
+        # ONGOING with issue: Add comment
         elif status == "ONGOING" and error.has_relevant_ticket:
             ticket_id = prev_state.linear_issue_id
             if ticket_id:
-                logger.info(f"[{signature[:30]}...] Adding comment to existing ticket: {ticket_id}")
+                logger.info(f"[{signature[:30]}...] Adding comment to existing issue: {ticket_id}")
                 
                 comment = f"Error continues. {error.error_count} occurrences affecting {error.org_count} organizations."
-                await self.linear.add_comment(ticket_id, comment)
+                await self.issues.comment_on_issue(ticket_id, comment)
+                await self.issues.update_issue(
+                    ticket_id,
+                    labels=["bug", "monitoring", error.severity.lower(), "ongoing"],
+                )
                 
                 return LinearTicketResult(
                     id=ticket_id,
                     identifier=ticket_id[:8],
                     title=f"[{error.severity}] {signature[:80]}",
-                    url=prev_state.linear_issue_url or f"https://linear.app/issue/{ticket_id}",
+                    url=prev_state.linear_issue_url or f"https://github.com/{self.issues.owner}/{self.issues.repo}/issues/{ticket_id}",
                     status=prev_state.linear_issue_status or "Unknown",
                     action="commented",
-                    is_preview=not self.linear.is_configured,
+                    is_preview=False,
                 )
         
         return None
@@ -266,7 +272,7 @@ This error has reoccurred after being marked as resolved.
             },
         }
         
-        # Update Linear tracking
+        # Update issue tracking
         if linear_result and not linear_result.is_preview:
             updates["linear_issue_id"] = linear_result.id
             updates["linear_issue_status"] = linear_result.status
@@ -279,7 +285,7 @@ This error has reoccurred after being marked as resolved.
         self.state.upsert_signature(signature, updates)
     
     def _build_ticket_description(self, error: AnalyzedError) -> str:
-        """Build Linear ticket description."""
+        """Build GitHub issue description."""
         parts = []
         
         # Summary

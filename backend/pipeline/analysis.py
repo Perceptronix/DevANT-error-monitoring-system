@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional, Literal
 
 from pydantic import BaseModel, Field
 
+from config import get_config
 from core.causality import correlate_deployment_events
 from core.scoring import infer_severity
 from ontology.models import Incident, RCAHypothesis
@@ -89,33 +90,23 @@ class ErrorAnalyzer:
     
     def _init_llm(self):
         """Initialize the LLM client."""
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-        
-        if anthropic_key and len(anthropic_key) > 10:  # Valid keys are much longer
-            try:
-                from langchain_anthropic import ChatAnthropic
-                self.llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
-                self.provider = "anthropic"
-                logger.info("Using Anthropic for LLM analysis")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Anthropic: {e}")
-                self.llm = None
-                self.provider = None
-        elif openai_key and len(openai_key) > 10:  # Valid keys are much longer
-            try:
-                from langchain_openai import ChatOpenAI
-                self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
-                self.provider = "openai"
-                logger.info("Using OpenAI for LLM analysis")
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenAI: {e}")
-                self.llm = None
-                self.provider = None
-        else:
-            self.llm = None
-            self.provider = None
-            logger.warning("No LLM API key configured - analysis will use fallback logic")
+        cfg = get_config()
+
+        if not cfg.groq.is_configured:
+            raise RuntimeError("Groq provider not configured")
+
+        try:
+            from langchain_groq import ChatGroq
+
+            self.llm = ChatGroq(
+                api_key=cfg.groq.api_key,
+                model_name=cfg.groq.model,
+                temperature=0,
+            )
+            self.provider = "groq"
+            logger.info("LLM provider initialized: groq")
+        except Exception as e:
+            raise RuntimeError(f"Groq initialization failed: {e}")
     
     async def analyze_errors(
         self, 

@@ -3,6 +3,7 @@ Lightweight repository analyzer focused on operational metadata extraction.
 - Designed for local-path scans (fast filesystem checks)
 - For remote GitHub URLs, returns pending requiring local path or allowlist for clone
 - Emits progress via progress_callback(step_name, partial_result)
+- Uses concurrent extraction for improved throughput
 """
 from typing import Callable, Dict, Any, List, Optional
 import os
@@ -10,13 +11,27 @@ import json
 from pathlib import Path
 import logging
 from datetime import datetime
+import asyncio
+import concurrent.futures
 from .topology_extractor import TopologyExtractor
 from .operational_scoring import OperationalScoringEngine
 from .github_ingestor import GitHubIngestor
 from .evidence_engine import EvidenceEngine
 from .analysis_state import transition_run, finalize_run, fail_run, get_run_snapshot, set_partial_update
 
-logger = logging.getLogger(__name__)
+# Import SignalFusionEngine + TopologyPropagationEngine - sys.path must include backend dir
+import sys
+_backend_dir = str(Path(__file__).parent.parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+ from core.signal_fusion import SignalFusionEngine, SignalType
+ from core.topology_propagation import TopologyPropagationEngine
+ from memory.incident_graph import IncidentGraph, IncidentNode
+ import hashlib
+ 
+ logger = logging.getLogger(__name__)
+ _incident_graph = IncidentGraph()  # Persistent temporal memory
 
 
 def _read_file_safe(path: Path, max_bytes: int = 16_384) -> str:
@@ -26,6 +41,226 @@ def _read_file_safe(path: Path, max_bytes: int = 16_384) -> str:
             return data.decode(errors='replace')
     except Exception:
         return ''
+
+
+# Concurrent extraction tasks for parallel repository scanning
+async def _extract_workflows_async(path: Path, max_entries: int = 10000) -> Dict[str, Any]:
+    """Extract GitHub workflows concurrently."""
+    result = {'workflows': [], 'extracted_count': 0}
+    entries_seen = 0
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    
+    try:
+        for root, dirs, files in os.walk(path):
+            entries_seen += len(files) + len(dirs)
+            if entries_seen > max_entries:
+                break
+            
+            for f in files:
+                if f.lower().endswith(('.yml', '.yaml')):
+                    relroot = os.path.relpath(root, path)
+                    if '.github/workflows' in os.path.join(relroot, f).replace('\\', '/'):
+                        fp = Path(root) / f
+                        # Read file in thread pool
+                        content = await loop.run_in_executor(executor, lambda p=fp: _read_file_safe(p))
+                        result['workflows'].append({
+                            'path': os.path.join(relroot, f),
+                            'content_preview': content[:1024]
+                        })
+                        result['extracted_count'] += 1
+    finally:
+        executor.shutdown(wait=False)
+    
+    return result
+
+
+async def _extract_deployments_async(path: Path, max_entries: int = 10000) -> Dict[str, Any]:
+    """Extract deployment artifacts (Dockerfile, K8s, Helm, Terraform) concurrently."""
+    result = {
+        'dockerfiles': [],
+        'kubernetes_manifests': [],
+        'helm_charts': [],
+        'terraform': [],
+        'extracted_count': 0
+    }
+    entries_seen = 0
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    
+    try:
+        for root, dirs, files in os.walk(path):
+            entries_seen += len(files) + len(dirs)
+            if entries_seen > max_entries:
+                break
+            
+            relroot = os.path.relpath(root, path)
+            for f in files:
+                nf = f.lower()
+                relf = os.path.join(relroot, f)
+                fp = Path(root) / f
+                
+                # Dockerfile detection
+                if nf == 'dockerfile' or nf.startswith('dockerfile.') or f.endswith('.dockerfile'):
+                    result['dockerfiles'].append(relf)
+                    result['extracted_count'] += 1
+                
+                # Helm charts
+                if nf == 'chart.yaml' or nf == 'chart.yml':
+                    result['helm_charts'].append(relf)
+                    result['extracted_count'] += 1
+                
+                # Terraform
+                if nf.endswith('.tf'):
+                    result['terraform'].append(relf)
+                    result['extracted_count'] += 1
+                
+                # Kubernetes manifests (needs file read)
+                if nf.endswith(('.yaml', '.yml')):
+                    content = await loop.run_in_executor(executor, lambda p=fp: _read_file_safe(p))
+                    lc = content.lower()
+                    if 'kind: deployment' in lc or 'kind: service' in lc or 'apiVersion:' in content:
+                        result['kubernetes_manifests'].append({
+                            'path': relf,
+                            'preview': content[:1024]
+                        })
+                        result['extracted_count'] += 1
+    finally:
+        executor.shutdown(wait=False)
+    
+    return result
+
+
+async def _extract_observability_async(path: Path, max_entries: int = 10000) -> Dict[str, Any]:
+    """Extract observability configuration (Prometheus, OTEL) concurrently."""
+    result = {
+        'prometheus': False,
+        'otel': False,
+        'extracted_count': 0
+    }
+    entries_seen = 0
+    
+    for root, dirs, files in os.walk(path):
+        entries_seen += len(files) + len(dirs)
+        if entries_seen > max_entries:
+            break
+        
+        for f in files:
+            nf = f.lower()
+            if 'prometheus' in nf or nf == 'prometheus.yml':
+                result['prometheus'] = True
+                result['extracted_count'] += 1
+            if 'otel' in nf or 'opentelemetry' in nf or 'collector' in nf:
+                result['otel'] = True
+                result['extracted_count'] += 1
+    
+    return result
+
+
+async def _extract_package_managers_async(path: Path, max_entries: int = 10000) -> Dict[str, Any]:
+    """Extract package manager files and detect services concurrently."""
+    result = {
+        'package_managers': [],
+        'services': [],
+        'extracted_count': 0
+    }
+    entries_seen = 0
+    
+    pm_markers = ('package.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'go.mod', 'Gemfile')
+    
+    for root, dirs, files in os.walk(path):
+        entries_seen += len(files) + len(dirs)
+        if entries_seen > max_entries:
+            break
+        
+        relroot = os.path.relpath(root, path)
+        for f in files:
+            nf = f.lower()
+            relf = os.path.join(relroot, f)
+            
+            if nf in pm_markers:
+                result['package_managers'].append(relf)
+                result['extracted_count'] += 1
+                
+                # Mark service directory
+                if nf in ('package.json', 'requirements.txt', 'pyproject.toml', 'go.mod', 'Gemfile'):
+                    service_dir = relroot if relroot != '.' else '/'
+                    result['services'].append({'path': service_dir, 'marker': nf})
+    
+    return result
+
+
+async def _extract_topology_async(path: Path) -> Dict[str, Any]:
+    """Extract topology concurrently."""
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    
+    try:
+        extractor = TopologyExtractor()
+        topology = await loop.run_in_executor(executor, lambda: extractor.extract_from_local_path(path))
+        return {'topology': topology, 'extracted_count': 1}
+    finally:
+        executor.shutdown(wait=False)
+
+
+async def _concurrent_extraction(path: Path) -> Dict[str, Any]:
+    """Run all extraction tasks concurrently and merge results."""
+    # Launch all extraction tasks in parallel
+    tasks = [
+        _extract_workflows_async(path),
+        _extract_deployments_async(path),
+        _extract_observability_async(path),
+        _extract_package_managers_async(path),
+        _extract_topology_async(path),
+    ]
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Merge results into unified evidence
+    merged = {
+        'files_present': [],
+        'workflows': [],
+        'dockerfiles': [],
+        'kubernetes_manifests': [],
+        'helm_charts': [],
+        'terraform': [],
+        'prometheus': False,
+        'otel': False,
+        'package_managers': [],
+        'services': [],
+        'topology': {'services': [], 'edges': []},
+        'extraction_tasks': {
+            'workflows': results[0] if not isinstance(results[0], Exception) else None,
+            'deployments': results[1] if not isinstance(results[1], Exception) else None,
+            'observability': results[2] if not isinstance(results[2], Exception) else None,
+            'package_managers': results[3] if not isinstance(results[3], Exception) else None,
+            'topology': results[4] if not isinstance(results[4], Exception) else None,
+        }
+    }
+    
+    # Consolidate results from each extraction task
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning(f"Extraction task {i} failed: {result}")
+            continue
+        
+        if i == 0 and result:  # workflows
+            merged['workflows'].extend(result.get('workflows', []))
+        elif i == 1 and result:  # deployments
+            merged['dockerfiles'].extend(result.get('dockerfiles', []))
+            merged['kubernetes_manifests'].extend(result.get('kubernetes_manifests', []))
+            merged['helm_charts'].extend(result.get('helm_charts', []))
+            merged['terraform'].extend(result.get('terraform', []))
+        elif i == 2 and result:  # observability
+            merged['prometheus'] = merged['prometheus'] or result.get('prometheus', False)
+            merged['otel'] = merged['otel'] or result.get('otel', False)
+        elif i == 3 and result:  # package managers
+            merged['package_managers'].extend(result.get('package_managers', []))
+            merged['services'].extend(result.get('services', []))
+        elif i == 4 and result:  # topology
+            merged['topology'] = result.get('topology', {'services': [], 'edges': []})
+    
+    return merged
 
 
 def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None, run_id: Optional[str] = None) -> Dict[str, Any]:
@@ -51,6 +286,18 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
     # monotonic sequence counter for emitted stage events
     seq_counter = 0
 
+    def _workflow_path(item: Any) -> str:
+        if isinstance(item, dict):
+            return item.get('path', '')
+        if isinstance(item, str):
+            try:
+                parsed = json.loads(item)
+                if isinstance(parsed, dict):
+                    return parsed.get('path', '')
+            except Exception:
+                return item
+        return str(item)
+
     def progress(step: str, payload: Dict[str, Any]):
         nonlocal seq_counter
         seq_counter += 1
@@ -61,8 +308,13 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             'github_ingest_started': 'repository_ingestion',
             'github_sample': 'repository_ingestion',
             'scanned_files': 'repository_ingestion',
+            'workflows_extracted': 'workflow_discovery',
+            'deployments_correlated': 'deployment_analysis',
+            'observability_checked': 'observability_analysis',
             'topology': 'topology_inference',
+            'regression_checked': 'regression_risk_analysis',
             'scored': 'operational_scoring',
+            'confidence_calibrated': 'confidence_calibration',
             'completed': 'final_operational_synthesis',
             'error': 'final_operational_synthesis',
         }
@@ -174,14 +426,160 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             }
             evidence.update(sample)
             progress('github_sample', {'sample_counts': {k: (len(v) if isinstance(v, list) else int(bool(v))) for k, v in sample.items()}})
+            progress('workflows_extracted', {
+                'workflow_count': len(evidence.get('workflows', [])),
+                'workflows': [_workflow_path(w) for w in evidence.get('workflows', [])[:5]],
+            })
+            progress('deployments_correlated', {
+                'dockerfiles': len(evidence.get('dockerfiles', [])),
+                'kubernetes_manifests': len(evidence.get('kubernetes_manifests', [])),
+                'helm_charts': len(evidence.get('helm_charts', [])),
+                'terraform': len(evidence.get('terraform', [])),
+            })
+            progress('observability_checked', {
+                'prometheus': evidence.get('prometheus', False),
+                'otel': evidence.get('otel', False),
+            })
             # Build topology from sampled manifests minimal
             topology = TopologyExtractor().extract_from_local_path(path) if path else {'services': [], 'edges': []}
+            
+            # Topology propagation analysis
+            propagation_engine = TopologyPropagationEngine()
+            propagation_result = propagation_engine.analyze(topology_graph=topology)
+            evidence['propagation'] = {
+                'blast_radius': propagation_result.blast_radius,
+                'critical_paths': propagation_result.critical_paths,
+                'dominant_service': propagation_result.dominant_service,
+                'upstream_risk': propagation_result.upstream_risk,
+                'downstream_risk': propagation_result.downstream_risk,
+                'service_count': propagation_result.service_count,
+                'edge_count': propagation_result.edge_count,
+                'propagation_depth': propagation_result.propagation_depth,
+                'high_risk_dependencies': propagation_result.high_risk_dependencies,
+            }
+            progress('topology_propagation', {
+                'blast_radius': propagation_result.blast_radius,
+                'dominant_service': propagation_result.dominant_service,
+                'critical_paths_count': len(propagation_result.critical_paths),
+                'upstream_risk': propagation_result.upstream_risk,
+                'downstream_risk': propagation_result.downstream_risk,
+                'service_count': propagation_result.service_count,
+                'edge_count': propagation_result.edge_count,
+            })
+            
             # Evidence engine deeper evaluation
             ee = EvidenceEngine()
-            _ = ee.evaluate(evidence, topology)
+            evidence_scores = ee.evaluate(evidence, topology)
             scoring_engine = OperationalScoringEngine()
             scores = scoring_engine.score_from_evidence(evidence, topology)
+            
+            # Signal fusion: integrate multi-signal reasoning into confidence
+            fusion_engine = SignalFusionEngine()
+            
+            # Map evidence scores to operational signals
+            deployment_conf = evidence_scores.get('deployment_confidence', 0.0)
+            observability_conf = evidence_scores.get('observability_confidence', 0.0)
+            topology_conf = evidence_scores.get('topology_confidence', 0.0)
+            
+            # Add signals to fusion engine
+            if deployment_conf > 0:
+                fusion_engine.add_signal(
+                    SignalType.TEMPORAL_CORRELATION,
+                    deployment_conf,
+                    "deployment_evidence",
+                    uncertainty=0.1 if deployment_conf < 0.7 else 0.05
+                )
+            
+            if observability_conf > 0:
+                fusion_engine.add_signal(
+                    SignalType.TELEMETRY_CONVERGENCE,
+                    observability_conf,
+                    "observability_evidence",
+                    uncertainty=0.1 if observability_conf < 0.7 else 0.05
+                )
+            
+            if topology_conf > 0:
+                fusion_engine.add_signal(
+                    SignalType.TOPOLOGY_CONSISTENCY,
+                    topology_conf,
+                    "topology_evidence",
+                    uncertainty=0.15 if topology_conf < 0.6 else 0.08
+                )
+            
+            # Derive regression similarity from risk assessment
+            regression_risk = scores.get('regression_risk', 0.5)
+            regression_similarity = 1.0 - min(1.0, regression_risk)
+            if regression_similarity > 0:
+                fusion_engine.add_signal(
+                    SignalType.REGRESSION_SIMILARITY,
+                    regression_similarity,
+                    "regression_analysis",
+                    uncertainty=0.15
+                )
+            
+            # Add workflow signal (deployment resilience)
+            workflow_count = len(evidence.get('workflows', []))
+            workflow_strength = min(1.0, workflow_count / 3.0)
+            if workflow_strength > 0:
+                fusion_engine.add_signal(
+                    SignalType.PROPAGATION_ALIGNMENT,
+                    workflow_strength,
+                    "workflow_evidence",
+                    uncertainty=0.1 if workflow_strength < 0.5 else 0.05
+                )
+            
+            # Add repository health signal
+            repo_health = min(
+                1.0,
+                (len(evidence.get('dockerfiles', [])) * 0.2 +
+                 len(evidence.get('kubernetes_manifests', [])) * 0.2 +
+                 len(evidence.get('helm_charts', [])) * 0.1 +
+                 len(evidence.get('terraform', [])) * 0.1) / 4.0 + (
+                 1.0 if evidence.get('prometheus') else 0.0) * 0.2 +
+                (1.0 if evidence.get('otel') else 0.0) * 0.2
+            )
+            if repo_health > 0:
+                fusion_engine.add_signal(
+                    SignalType.ANOMALY_ALIGNMENT,
+                    repo_health,
+                    "repository_health",
+                    uncertainty=0.12
+                )
+            
+            # Fuse signals into calibrated confidence
+            fusion_result = fusion_engine.fuse()
+            
+            # Update scores with fused confidence
+            scores['operational_confidence'] = fusion_result['confidence']
+            scores['signal_consensus'] = fusion_result['convergence_score']
+            scores['uncertainty'] = fusion_result['uncertainty']
+            scores['fusion_signal_count'] = fusion_result['signal_count']
+            scores['fusion_sparse_evidence'] = fusion_result['sparse_evidence']
+            
+            regression_signals = {
+                'observability_gap': not observability_conf,
+                'topology_confidence': topology_conf,
+                'deployment_confidence': deployment_conf,
+                'signal_consensus': fusion_result['convergence_score'],
+                'dominant_signals': [s.value for s in fusion_result.get('dominant_signals', [])],
+            }
+            progress('regression_checked', {
+                'risk_score': scores.get('regression_risk', 0),
+                'regression_signals': regression_signals,
+            })
             progress('scored', {'scores': scores})
+            progress('confidence_calibrated', {
+                'production_readiness': scores.get('production_readiness', 0),
+                'regression_risk': scores.get('regression_risk', 0),
+                'operational_confidence': scores.get('operational_confidence', 0),
+                'signal_consensus': scores.get('signal_consensus', 0),
+                'uncertainty': scores.get('uncertainty', 0),
+                'signal_count': scores.get('fusion_signal_count', 0),
+                'sparse_evidence': scores.get('fusion_sparse_evidence', False),
+                'confidence_basis': 'multi_signal_fusion',
+                'dominant_signal': fusion_result.get('dominant_signals', [])[0].value if fusion_result.get('dominant_signals') else None,
+                'conflict_count': fusion_result.get('conflict_count', 0),
+            })
             result.update({'scanned': True, 'evidence': evidence, 'topology': topology, 'scores': scores})
             progress('completed', {'result_summary': {'services': len(evidence.get('services', [])), 'scores': scores}})
             # finalize run deterministically
@@ -221,86 +619,63 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             pass
         return json.loads(json.dumps(result))
 
-    # Start scanning
-    progress('started', {'status': 'scanning_local_path', 'path': str(path)})
-    evidence: Dict[str, Any] = {
-        'files_present': [],
-        'workflows': [],
-        'dockerfiles': [],
-        'kubernetes_manifests': [],
-        'helm_charts': [],
-        'terraform': [],
-        'prometheus': False,
-        'otel': False,
-        'package_managers': [],
-        'services': [],
-    }
-
-    # Walk limited depth to avoid expensive operations
-    max_entries = 10000
-    entries_seen = 0
-    for root, dirs, files in os.walk(path):
-        entries_seen += len(files) + len(dirs)
-        if entries_seen > max_entries:
-            logger.warning('scan truncated: too many entries')
-            break
-
-        relroot = os.path.relpath(root, path)
-        for f in files:
-            fp = Path(root) / f
-            nf = f.lower()
-            evidence['files_present'].append(os.path.join(relroot, f))
-
-            # Detect workflows
-            if relroot.startswith('.github') and nf.endswith('.yml') or nf.endswith('.yaml'):
-                if '.github/workflows' in os.path.join(relroot, f).replace('\\', '/'):
-                    content = _read_file_safe(fp)
-                    evidence['workflows'].append({'path': os.path.join(relroot, f), 'content_preview': content[:1024]})
-
-            # Dockerfile
-            if nf == 'dockerfile' or nf.startswith('dockerfile') or f.lower().endswith('.dockerfile'):
-                evidence['dockerfiles'].append(os.path.join(relroot, f))
-
-            # Kubernetes manifests: simple YAML files containing 'kind: Deployment' or 'apiVersion'
-            if nf.endswith('.yaml') or nf.endswith('.yml'):
-                content = _read_file_safe(fp)
-                lc = content.lower()
-                if 'kind: deployment' in lc or 'kind: service' in lc or 'apiVersion:' in content:
-                    evidence['kubernetes_manifests'].append({'path': os.path.join(relroot, f), 'preview': content[:1024]})
-
-            # Helm charts
-            if f.lower() == 'chart.yaml' and 'charts' in relroot:
-                evidence['helm_charts'].append(os.path.join(relroot, f))
-
-            # Terraform
-            if f.endswith('.tf'):
-                evidence['terraform'].append(os.path.join(relroot, f))
-
-            # Prometheus or OTEL config detection
-            if 'prometheus' in nf or 'prometheus.yml' in nf:
-                evidence['prometheus'] = True
-            if 'otel' in nf or 'opentelemetry' in nf or 'collector' in nf:
-                evidence['otel'] = True
-
-            # Package managers
-            if nf in ('package.json', 'pyproject.toml', 'requirements.txt', 'setup.py'):
-                evidence['package_managers'].append(os.path.join(relroot, f))
-
-            # Heuristic: service directories (presence of Dockerfile, package.json, requirements)
-            if nf in ('package.json', 'requirements.txt', 'pyproject.toml'):
-                # mark service at directory
-                service_dir = relroot if relroot != '.' else '/'
-                evidence['services'].append({'path': service_dir, 'marker': nf})
-
-        # Limit depth to avoid recursion into node_modules, .venv
-        if any(p in root for p in ['node_modules', '.venv', 'venv', '__pycache__']):
-            dirs[:] = []
-
+    # Start scanning with concurrent extraction
+    progress('started', {'status': 'scanning_local_path_concurrent', 'path': str(path)})
+    
+    # Run concurrent extraction tasks
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        concurrent_evidence = loop.run_until_complete(_concurrent_extraction(path))
+        loop.close()
+    except Exception as e:
+        logger.exception(f"Concurrent extraction failed: {e}")
+        concurrent_evidence = {
+            'files_present': [],
+            'workflows': [],
+            'dockerfiles': [],
+            'kubernetes_manifests': [],
+            'helm_charts': [],
+            'terraform': [],
+            'prometheus': False,
+            'otel': False,
+            'package_managers': [],
+            'services': [],
+            'topology': {'services': [], 'edges': []},
+        }
+    
+    # Merge concurrent extraction results
+    evidence = concurrent_evidence.copy()
+    
+    # Emit progress for each completed extraction task
+    extraction_tasks = evidence.pop('extraction_tasks', {})
+    if extraction_tasks.get('workflows'):
+        progress('workflows_extracted', {
+            'workflow_count': extraction_tasks['workflows'].get('extracted_count', 0),
+            'concurrent': True,
+        })
+    
+    if extraction_tasks.get('deployments'):
+        progress('deployments_correlated', {
+            'dockerfiles': len(evidence.get('dockerfiles', [])),
+            'kubernetes_manifests': len(evidence.get('kubernetes_manifests', [])),
+            'helm_charts': len(evidence.get('helm_charts', [])),
+            'terraform': len(evidence.get('terraform', [])),
+            'concurrent': True,
+        })
+    
+    if extraction_tasks.get('observability'):
+        progress('observability_checked', {
+            'prometheus': evidence.get('prometheus', False),
+            'otel': evidence.get('otel', False),
+            'concurrent': True,
+        })
+    
     # Normalize dedupe lists
     for k in ('dockerfiles', 'workflows', 'helm_charts', 'terraform', 'kubernetes_manifests'):
         evidence[k] = list({json.dumps(e) if isinstance(e, dict) else e for e in evidence.get(k, [])})
 
-    # safe counts: if value is list/dict count elements, if bool use int, else 1/0
+    # Safe counts
     counts = {}
     for k, v in evidence.items():
         if isinstance(v, (list, dict)):
@@ -311,16 +686,170 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             counts[k] = 0
         else:
             counts[k] = 1
-    progress('scanned_files', {'counts': counts})
+    
+    progress('scanned_files', {'counts': counts, 'concurrent': True, 'extraction_method': 'async_parallel'})
+    progress('workflows_extracted', {
+        'workflow_count': len(evidence.get('workflows', [])),
+        'workflows': [_workflow_path(w) for w in evidence.get('workflows', [])[:5]],
+        'concurrent': True,
+    })
+    progress('deployments_correlated', {
+        'dockerfiles': len(evidence.get('dockerfiles', [])),
+        'kubernetes_manifests': len(evidence.get('kubernetes_manifests', [])),
+        'helm_charts': len(evidence.get('helm_charts', [])),
+        'terraform': len(evidence.get('terraform', [])),
+        'concurrent': True,
+    })
+    progress('observability_checked', {
+        'prometheus': evidence.get('prometheus', False),
+        'otel': evidence.get('otel', False),
+        'concurrent': True,
+    })
 
-    # Topology extraction
-    topology = TopologyExtractor().extract_from_local_path(path)
-    progress('topology', {'topology': topology})
+    # Topology already extracted concurrently
+    topology = evidence.get('topology', {'services': [], 'edges': []})
+    progress('topology', {'topology': topology, 'concurrent': True})
+    
+    # Topology propagation analysis: compute blast radius, critical paths, risk
+    propagation_engine = TopologyPropagationEngine()
+    propagation_result = propagation_engine.analyze(topology_graph=topology)
+    
+    # Expose propagation analysis in evidence
+    evidence['propagation'] = {
+        'blast_radius': propagation_result.blast_radius,
+        'critical_paths': propagation_result.critical_paths,
+        'dominant_service': propagation_result.dominant_service,
+        'upstream_risk': propagation_result.upstream_risk,
+        'downstream_risk': propagation_result.downstream_risk,
+        'service_count': propagation_result.service_count,
+        'edge_count': propagation_result.edge_count,
+        'propagation_depth': propagation_result.propagation_depth,
+        'high_risk_dependencies': propagation_result.high_risk_dependencies,
+    }
+    
+    # Emit propagation progress event
+    progress('topology_propagation', {
+        'blast_radius': propagation_result.blast_radius,
+        'dominant_service': propagation_result.dominant_service,
+        'critical_paths_count': len(propagation_result.critical_paths),
+        'upstream_risk': propagation_result.upstream_risk,
+        'downstream_risk': propagation_result.downstream_risk,
+        'service_count': propagation_result.service_count,
+        'edge_count': propagation_result.edge_count,
+    })
 
     # Scoring
     scoring_engine = OperationalScoringEngine()
     scores = scoring_engine.score_from_evidence(evidence, topology)
+    evidence_scores = EvidenceEngine().evaluate(evidence, topology)
+    
+    # Signal fusion: integrate multi-signal reasoning into confidence
+    fusion_engine = SignalFusionEngine()
+    
+    # Map evidence scores to operational signals
+    deployment_conf = evidence_scores.get('deployment_confidence', 0.0)
+    observability_conf = evidence_scores.get('observability_confidence', 0.0)
+    topology_conf = evidence_scores.get('topology_confidence', 0.0)
+    
+    # Add signals to fusion engine
+    if deployment_conf > 0:
+        fusion_engine.add_signal(
+            SignalType.TEMPORAL_CORRELATION,
+            deployment_conf,
+            "deployment_evidence",
+            uncertainty=0.1 if deployment_conf < 0.7 else 0.05
+        )
+    
+    if observability_conf > 0:
+        fusion_engine.add_signal(
+            SignalType.TELEMETRY_CONVERGENCE,
+            observability_conf,
+            "observability_evidence",
+            uncertainty=0.1 if observability_conf < 0.7 else 0.05
+        )
+    
+    if topology_conf > 0:
+        fusion_engine.add_signal(
+            SignalType.TOPOLOGY_CONSISTENCY,
+            topology_conf,
+            "topology_evidence",
+            uncertainty=0.15 if topology_conf < 0.6 else 0.08
+        )
+    
+    # Derive regression similarity from risk assessment
+    regression_risk = scores.get('regression_risk', 0.5)
+    regression_similarity = 1.0 - min(1.0, regression_risk)
+    if regression_similarity > 0:
+        fusion_engine.add_signal(
+            SignalType.REGRESSION_SIMILARITY,
+            regression_similarity,
+            "regression_analysis",
+            uncertainty=0.15
+        )
+    
+    # Add workflow signal (deployment resilience)
+    workflow_count = len(evidence.get('workflows', []))
+    workflow_strength = min(1.0, workflow_count / 3.0)
+    if workflow_strength > 0:
+        fusion_engine.add_signal(
+            SignalType.PROPAGATION_ALIGNMENT,
+            workflow_strength,
+            "workflow_evidence",
+            uncertainty=0.1 if workflow_strength < 0.5 else 0.05
+        )
+    
+    # Add repository health signal
+    repo_health = min(
+        1.0,
+        (len(evidence.get('dockerfiles', [])) * 0.2 +
+         len(evidence.get('kubernetes_manifests', [])) * 0.2 +
+         len(evidence.get('helm_charts', [])) * 0.1 +
+         len(evidence.get('terraform', [])) * 0.1) / 4.0 + (
+         1.0 if evidence.get('prometheus') else 0.0) * 0.2 +
+        (1.0 if evidence.get('otel') else 0.0) * 0.2
+    )
+    if repo_health > 0:
+        fusion_engine.add_signal(
+            SignalType.ANOMALY_ALIGNMENT,
+            repo_health,
+            "repository_health",
+            uncertainty=0.12
+        )
+    
+    # Fuse signals into calibrated confidence
+    fusion_result = fusion_engine.fuse()
+    
+    # Update scores with fused confidence
+    scores['operational_confidence'] = fusion_result['confidence']
+    scores['signal_consensus'] = fusion_result['convergence_score']
+    scores['uncertainty'] = fusion_result['uncertainty']
+    scores['fusion_signal_count'] = fusion_result['signal_count']
+    scores['fusion_sparse_evidence'] = fusion_result['sparse_evidence']
+    
+    regression_signals = {
+        'observability_gap': not observability_conf,
+        'topology_confidence': topology_conf,
+        'deployment_confidence': deployment_conf,
+        'signal_consensus': fusion_result['convergence_score'],
+        'dominant_signals': [s.value for s in fusion_result.get('dominant_signals', [])],
+    }
+    progress('regression_checked', {
+        'risk_score': scores.get('regression_risk', 0),
+        'regression_signals': regression_signals,
+    })
     progress('scored', {'scores': scores})
+    progress('confidence_calibrated', {
+        'production_readiness': scores.get('production_readiness', 0),
+        'regression_risk': scores.get('regression_risk', 0),
+        'operational_confidence': scores.get('operational_confidence', 0),
+        'signal_consensus': scores.get('signal_consensus', 0),
+        'uncertainty': scores.get('uncertainty', 0),
+        'signal_count': scores.get('fusion_signal_count', 0),
+        'sparse_evidence': scores.get('fusion_sparse_evidence', False),
+        'confidence_basis': 'multi_signal_fusion',
+        'dominant_signal': fusion_result.get('dominant_signals', [])[0].value if fusion_result.get('dominant_signals') else None,
+        'conflict_count': fusion_result.get('conflict_count', 0),
+    })
 
     result['scanned'] = True
     result['evidence'] = evidence

@@ -186,7 +186,7 @@ class ErrorEnricher:
         query: str,
         signature: str,
     ) -> List[RelatedTicket]:
-        """Search for related tickets from Linear."""
+        """Search for related issues from GitHub Issues."""
         if not self.airweave.is_configured:
             return self._mock_ticket_results()
         

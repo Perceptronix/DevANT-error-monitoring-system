@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 
 class ContextSearcher:
     """
-    Searches for context related to errors using Airweave.
+    Searches for context related to errors using ChromaDB.
     
     Finds:
     - Related code from GitHub
-    - Similar tickets from Linear
+    - Similar issues from GitHub Issues
     - Relevant documentation
     """
     
@@ -79,7 +79,7 @@ class ContextSearcher:
             code_results = await self._search_source(query, source_filter="github")
             
             # Search for related tickets
-            ticket_results = await self._search_source(query, source_filter="linear")
+            ticket_results = await self._search_source(query, source_filter="github_issues")
             
             # Search documentation
             doc_results = await self._search_source(query, source_filter=None, limit=3)
@@ -200,8 +200,8 @@ class GoogleDriveClient:
                 {
                     "title": "Google Drive rate limits hitting during large workspace syncs",
                     "content": "**Problem:** Customers with 10k+ files in Drive are hitting 429s consistently.\n\n**Root cause:** We're making parallel requests without respecting quotas.\n\n**Fix:** Implemented token bucket rate limiter with 100 req/100s limit. Also added request batching for metadata calls.\n\n**Status:** Fixed in v2.4.1",
-                    "source": "linear",
-                    "url": "https://linear.app/acme/issue/ENG-1847",
+                    "source": "github_issues",
+                    "url": "https://github.com/acme/sync-platform/issues/1847",
                     "score": 0.91,
                 }
             ]
@@ -252,8 +252,8 @@ async def get_db() -> AsyncSession:
                 {
                     "title": "Connection pool exhaustion causing 500s during peak hours",
                     "content": "**Impact:** ~2% of API requests failing between 2-4pm UTC\n\n**Investigation:**\n- `pg_stat_activity` shows 50 connections from api-server pods\n- Pool size was 10 per pod × 5 pods = 50 (at limit)\n- Long-running sync queries holding connections\n\n**Resolution:**\n1. Increased pool_size to 20 per pod\n2. Added statement_timeout=30s for sync queries\n3. Moving heavy queries to read replica\n\n**Monitoring:** Added pool_exhausted metric to dashboard",
-                    "source": "linear",
-                    "url": "https://linear.app/acme/issue/ENG-2103",
+                    "source": "github_issues",
+                    "url": "https://github.com/acme/sync-platform/issues/2103",
                     "score": 0.88,
                 }
             ]
@@ -311,8 +311,8 @@ async def get_db() -> AsyncSession:
                 {
                     "title": "Google OAuth tokens expiring unexpectedly after 7 days",
                     "content": "**Issue:** Users report integrations disconnecting without warning\n\n**Root cause:** Google's \"Testing\" OAuth status expires refresh tokens after 7 days of user inactivity. Need to apply for \"Production\" verification.\n\n**Workaround:** Email users 5 days after last activity to prompt re-auth\n\n**Long-term fix:**\n1. Submit app for Google verification (in progress)\n2. Add proactive token refresh before expiry\n3. Better error messaging in UI",
-                    "source": "linear",
-                    "url": "https://linear.app/acme/issue/ENG-1592",
+                    "source": "github_issues",
+                    "url": "https://github.com/acme/sync-platform/issues/1592",
                     "score": 0.92,
                 }
             ]
@@ -367,8 +367,8 @@ async def extract_text_from_pdf(file_path: Path) -> str:
                 {
                     "title": "PDF processing failing on scanned documents",
                     "content": "**Problem:** Some customer PDFs fail with \"EOF marker not found\"\n\n**Analysis:** These are scanned PDFs where the scanner software created non-standard PDF structure.\n\n**Solution:**\n1. Added OCR fallback using Tesseract\n2. Skip corrupted files and mark for manual review\n3. Notify customer of unprocessable files",
-                    "source": "linear",
-                    "url": "https://linear.app/acme/issue/ENG-987",
+                    "source": "github_issues",
+                    "url": "https://github.com/acme/sync-platform/issues/987",
                     "score": 0.85,
                 }
             ]

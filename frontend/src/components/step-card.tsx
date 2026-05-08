@@ -1003,7 +1003,7 @@ function AlertPreviewData({ data }: { data: Record<string, unknown> }) {
     description: string
     affected_orgs: string[]
     slack_preview: { blocks: Array<{ type: string; text: string }> }
-    linear_preview: { title: string; description: string; labels: string[] }
+    issue_preview: { title: string; description: string; labels: string[] }
   }>
 
   const severityEmoji: Record<string, string> = {

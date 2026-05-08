@@ -7,7 +7,7 @@ It features:
 - LLM-powered semantic clustering
 - Airweave context search for related code and tickets
 - Smart suppression logic (NEW/REGRESSION/ONGOING)
-- Optional Linear and Slack integrations with preview fallbacks
+- Optional GitHub Issues and Slack integrations with preview fallbacks
 """
 import asyncio
 import json
@@ -201,7 +201,7 @@ async def run_pipeline(config: PipelineConfig) -> PipelineState:
         # Set data while still running so UI can show it expanding
         state.steps[2].data = {
             "results": context_results,
-            "sources_searched": ["GitHub", "Linear", "Slack"]
+            "sources_searched": ["GitHub", "GitHub Issues", "Slack"]
         }
         await manager.broadcast({"type": "step_data_ready", "step_id": "context-search", "state": state.model_dump()})
         await asyncio.sleep(1.5)  # Pause so users can see the data
@@ -252,7 +252,7 @@ async def run_pipeline(config: PipelineConfig) -> PipelineState:
                 "description": analysis.get("root_cause", ""),
                 "affected_orgs": analysis.get("affected_orgs", []),
                 "slack_preview": _generate_slack_preview(analysis),
-                "linear_preview": _generate_linear_preview(analysis),
+                "issue_preview": _generate_github_issue_preview(analysis),
             }
             alerts.append(alert)
         
@@ -364,8 +364,8 @@ def _generate_slack_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _generate_linear_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate a Linear ticket preview."""
+def _generate_github_issue_preview(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a GitHub issue preview."""
     title = _generate_actionable_title(analysis)
     
     return {
@@ -431,7 +431,7 @@ async def get_app_config():
     - Airweave configuration
     - LLM provider
     - Data source (sample, azure, sentry, etc.)
-    - Integration status (Linear, Slack)
+    - Integration status (GitHub Issues, Slack)
     - State storage stats
     """
     config = get_config()
@@ -468,10 +468,12 @@ async def get_app_config():
             "available": available_sources,
         },
         "integrations": {
-            "linear": {
-                "enabled": config.linear.enabled,
-                "configured": config.linear.is_configured,
-                "mode": "live" if config.linear.is_configured else "preview",
+            "github_issues": {
+                "enabled": config.github.enabled,
+                "configured": config.github.is_configured,
+                "owner": config.github.owner,
+                "repo": config.github.repo,
+                "mode": "live" if config.github.is_configured else "preview",
             },
             "slack": {
                 "enabled": config.slack.enabled,
@@ -577,7 +579,20 @@ async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
             def progress(step, payload):
                 return None
 
-            analyze_repository(req.repo_url, local_path=req.local_path, progress_callback=progress, run_id=run_id)
+            loop = asyncio.get_event_loop()
+
+            def _sync():
+                def progress(step, payload):
+                    return None
+
+                analyze_repository(
+                    req.repo_url,
+                    local_path=req.local_path,
+                    progress_callback=progress,
+                    run_id=run_id,
+                )
+
+            await loop.run_in_executor(None, _sync)
         except Exception as e:
             fail_run(run_id, str(e))
 

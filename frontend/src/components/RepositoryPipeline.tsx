@@ -17,16 +17,17 @@ interface Props {
   snapshot: any | null
 }
 
-const DEFAULT_STAGES = [
-  'Repository Ingestion',
-  'Workflow Discovery',
-  'Deployment Analysis',
-  'Observability Analysis',
-  'Topology Inference',
-  'Regression Risk Analysis',
-  'Operational Scoring',
-  'Confidence Calibration',
-  'Final Operational Synthesis',
+const DEFAULT_STAGE_IDS = [
+  'repository_ingestion',
+  'workflow_discovery',
+  'deployment_analysis',
+  'observability_analysis',
+  'topology_inference',
+  'topology_propagation',
+  'regression_risk_analysis',
+  'operational_scoring',
+  'confidence_calibration',
+  'final_operational_synthesis',
 ]
 
 export function normalize(s: string) {
@@ -66,32 +67,27 @@ export default function RepositoryPipeline({ snapshot }: Props) {
         })
       }
       // ensure all default stages present
-      for (const name of DEFAULT_STAGES) {
-        if (!data.find((d) => d.name === name)) data.push({ id: name, name, state: 'pending' })
+      for (const id of DEFAULT_STAGE_IDS) {
+        const name = normalize(id)
+        if (!data.find((d) => d.id === id || d.name === name)) data.push({ id, name, state: 'pending' })
       }
       return data
     }
 
     // If partial is object keyed by step id/name, map onto DEFAULT_STAGES in order
     if (partial && typeof partial === 'object') {
-      for (const name of DEFAULT_STAGES) {
-        // try possible keys: normalized lower, snake, lower
-        const keys = [
-          name.toLowerCase().replace(/ /g, '_'),
-          name.toLowerCase().replace(/ /g, '-'),
-          name.toLowerCase(),
-        ]
+      for (const id of DEFAULT_STAGE_IDS) {
+        const name = normalize(id)
         let entry: any = undefined
-        for (const k of keys) {
-          if (Object.prototype.hasOwnProperty.call(partial, k)) {
-            entry = partial[k]
-            break
-          }
+        if (Object.prototype.hasOwnProperty.call(partial, id)) {
+          entry = partial[id]
+        } else if (Object.prototype.hasOwnProperty.call(partial, name)) {
+          entry = partial[name]
         }
 
         if (entry) {
           data.push({
-            id: name,
+            id,
             name,
             state: entry.state || (entry.status as StageState) || 'partial',
             progress: typeof entry.progress === 'number' ? entry.progress : undefined,
@@ -99,14 +95,14 @@ export default function RepositoryPipeline({ snapshot }: Props) {
             note: entry.note || entry.reasoning || entry.data?.note,
           })
         } else {
-          data.push({ id: name, name, state: 'pending' })
+          data.push({ id, name, state: 'pending' })
         }
       }
       return data
     }
 
     // fallback: no partial info
-    return DEFAULT_STAGES.map((name) => ({ id: name, name, state: 'pending' as StageState }))
+    return DEFAULT_STAGE_IDS.map((id) => ({ id, name: normalize(id), state: 'pending' as StageState }))
   }, [snapshot])
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})

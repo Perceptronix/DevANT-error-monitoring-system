@@ -29,12 +29,13 @@ class GitHubConfig:
     """GitHub API configuration for code context."""
     enabled: bool = False
     token: Optional[str] = None
+    owner: Optional[str] = None
     repo: Optional[str] = None
     
     @property
     def is_configured(self) -> bool:
         """Check if GitHub is configured and enabled."""
-        return self.enabled and bool(self.token) and bool(self.repo)
+        return self.enabled and bool(self.token) and bool(self.owner) and bool(self.repo)
 
 
 @dataclass
@@ -184,10 +185,9 @@ class Config:
     # Optional: GitHub for code context
     github: GitHubConfig = field(default_factory=GitHubConfig)
 
-    # Legacy/backward-compatible integrations (Airweave, LLM, Linear, Slack)
+    # Legacy/backward-compatible integrations (Airweave, LLM, Slack)
     airweave: LegacyAirweaveConfig = field(default_factory=LegacyAirweaveConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
-    linear: LegacyLinearConfig = field(default_factory=LegacyLinearConfig)
     slack: LegacySlackConfig = field(default_factory=LegacySlackConfig)
     
     # Data source (sample by default)
@@ -212,6 +212,7 @@ class Config:
             github=GitHubConfig(
                 enabled=os.getenv("GITHUB_ENABLED", "true").lower() == "true",
                 token=os.getenv("GITHUB_TOKEN"),
+                owner=os.getenv("GITHUB_OWNER"),
                 repo=os.getenv("GITHUB_REPO"),
             ),
             
@@ -249,12 +250,6 @@ class Config:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         )
 
-        cfg.linear = LegacyLinearConfig(
-            enabled=os.getenv("LINEAR_ENABLED", "false").lower() == "true",
-            api_key=os.getenv("LINEAR_API_KEY"),
-            team_id=os.getenv("LINEAR_TEAM_ID"),
-        )
-
         cfg.slack = LegacySlackConfig(
             enabled=os.getenv("SLACK_ENABLED", "false").lower() == "true",
             api_key=os.getenv("SLACK_BOT_TOKEN"),
@@ -282,6 +277,7 @@ class Config:
             "github": {
                 "enabled": self.github.enabled,
                 "configured": self.github.is_configured,
+                "owner": self.github.owner if self.github.is_configured else None,
                 "repo": self.github.repo if self.github.is_configured else None,
             },
             "data_source": {

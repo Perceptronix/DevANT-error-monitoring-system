@@ -2,8 +2,15 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import datetime
 
-from core.identity import same_incident
+import json, logging, threading
+from pathlib import Path
+from dataclasses import asdict
+from datetime import timedelta
+from typing import Dict, Any
 
+logger = logging.getLogger(__name__)
+INCIDENT_GRAPH_FILE = Path("data/incident_graph.json")
+_lock = threading.Lock()
 
 @dataclass
 class IncidentMemory:
@@ -21,32 +28,168 @@ class IncidentMemory:
     status: str = "open"
     historical_matches: List[str] = field(default_factory=list)
 
+@dataclass
+class IncidentNode:
+    incident_id: str
+    timestamp: str
+    repo: str
+    dominant_service: str
+    blast_radius: int
+    operational_confidence: float
+    regression_risk: float
+    topology_hash: str
+    critical_paths: List[List[str]] = field(default_factory=list)
+    upstream_risk: float = 0.0
+    downstream_risk: float = 0.0
+
+@dataclass
+class IncidentEdge:
+    source_incident: str
+    target_incident: str
+    relationship: str
+    confidence: float
 
 class IncidentGraph:
-    """In-memory regression and incident timeline store.
-
-    This is a small, index-like structure used to store resolved incidents
-    and query for historical matches. It is intentionally lightweight and
-    designed to be replaced by a durable store if needed.
-    """
-
     def __init__(self):
+        self.nodes: Dict[str, IncidentNode] = {}
+        self.edges: List[IncidentEdge] = []
         self.incidents: List[IncidentMemory] = []
-
+        self._load_from_disk()
+    
+    def add_incident(self, incident_id: str, timestamp: str, repo: str, dominant_service: str,
+                     blast_radius: int, operational_confidence: float, regression_risk: float,
+                     topology_hash: str, critical_paths: Optional[List[List[str]]] = None,
+                     upstream_risk: float = 0.0, downstream_risk: float = 0.0) -> IncidentNode:
+        node = IncidentNode(incident_id, timestamp, repo, dominant_service, blast_radius,
+                           operational_confidence, regression_risk, topology_hash,
+                           critical_paths or [], upstream_risk, downstream_risk)
+        self.nodes[incident_id] = node
+        self._detect_relationships(node)
+        self._save_to_disk()
+        return node
+    
+    def detect_recurring_patterns(self, incident: IncidentNode) -> Dict[str, Any]:
+        if not self.nodes:
+            return {'is_recurring': False, 'matched_incidents': [], 'pattern_type': None,
+                    'recurrence_count': 0, 'confidence': 0.0}
+        matched, pattern_types = [], []
+        same_service = [n for n, nd in self.nodes.items()
+                       if nd.dominant_service == incident.dominant_service and nd.repo == incident.repo]
+        if len(same_service) >= 2:
+            matched.extend(same_service)
+            pattern_types.append('dominant_service')
+        similar_radius = [n for n, nd in self.nodes.items()
+                         if abs(nd.blast_radius - incident.blast_radius) <= 1 and nd.repo == incident.repo]
+        if len(similar_radius) >= 3:
+            matched.extend(similar_radius)
+            pattern_types.append('blast_radius')
+        high_regression = [n for n, nd in self.nodes.items()
+                          if nd.regression_risk > 0.6 and incident.regression_risk > 0.6 and nd.repo == incident.repo]
+        if len(high_regression) >= 2:
+            matched.extend(high_regression)
+            pattern_types.append('regression')
+        matched = list(set(matched))
+        return {'is_recurring': len(matched) >= 2, 'matched_incidents': matched[:10],
+                'pattern_type': pattern_types[0] if pattern_types else None,
+                'recurrence_count': len(matched), 'confidence': min(1.0, len(matched) / 5.0) if matched else 0.0}
+    
+    def analyze_operational_drift(self, repo: str) -> Dict[str, Any]:
+        repo_inc = [n for n in self.nodes.values() if n.repo == repo]
+        if len(repo_inc) < 2:
+            return {'has_drift': False, 'blast_radius_trend': 0.0, 'confidence_trend': 0.0,
+                    'regression_trend': 0.0, 'topology_instability': 0.0,
+                    'recent_incidents': len(repo_inc), 'drift_score': 0.0}
+        sorted_inc = sorted(repo_inc, key=lambda x: x.timestamp)
+        mid = len(sorted_inc) // 2
+        first, second = sorted_inc[:mid], sorted_inc[mid:]
+        avg_r1 = sum(i.blast_radius for i in first) / len(first)
+        avg_r2 = sum(i.blast_radius for i in second) / len(second)
+        trend_r = 1.0 if avg_r2 > avg_r1 * 1.1 else (-1.0 if avg_r2 < avg_r1 * 0.9 else 0.0)
+        avg_c1 = sum(i.operational_confidence for i in first) / len(first)
+        avg_c2 = sum(i.operational_confidence for i in second) / len(second)
+        trend_c = -1.0 if avg_c2 < avg_c1 * 0.9 else (1.0 if avg_c2 > avg_c1 * 1.1 else 0.0)
+        avg_g1 = sum(i.regression_risk for i in first) / len(first)
+        avg_g2 = sum(i.regression_risk for i in second) / len(second)
+        trend_g = 1.0 if avg_g2 > avg_g1 * 1.1 else (-1.0 if avg_g2 < avg_g1 * 0.9 else 0.0)
+        topo_h = set(i.topology_hash for i in repo_inc)
+        topo_inst = min(1.0, len(topo_h) / len(repo_inc))
+        now = datetime.fromisoformat(sorted_inc[-1].timestamp)
+        wk_ago = now - timedelta(days=7)
+        recent = sum(1 for i in repo_inc if datetime.fromisoformat(i.timestamp) >= wk_ago)
+        drift = min(1.0, abs(trend_r) * 0.3 + abs(trend_c) * 0.3 + abs(trend_g) * 0.2 + topo_inst * 0.2)
+        return {'has_drift': drift > 0.3, 'blast_radius_trend': trend_r, 'confidence_trend': trend_c,
+                'regression_trend': trend_g, 'topology_instability': topo_inst,
+                'recent_incidents': recent, 'drift_score': drift}
+    
+    def find_historical_similarity(self, incident: IncidentNode, threshold: float = 0.7) -> List[Dict]:
+        sims = []
+        for n_id, nd in self.nodes.items():
+            sm = 1.0 if nd.dominant_service == incident.dominant_service else 0.0
+            rm = 1.0 - min(1.0, abs(nd.blast_radius - incident.blast_radius) / 10.0)
+            gm = 1.0 - abs(nd.regression_risk - incident.regression_risk)
+            cm = 1.0 - abs(nd.operational_confidence - incident.operational_confidence)
+            sim = sm * 0.4 + rm * 0.3 + gm * 0.15 + cm * 0.15
+            if sim >= threshold:
+                sims.append({'incident_id': n_id, 'similarity': sim, 'timestamp': nd.timestamp,
+                            'dominant_service': nd.dominant_service, 'blast_radius': nd.blast_radius})
+        sims.sort(key=lambda x: x['similarity'], reverse=True)
+        return sims[:10]
+    
+    def get_incident_lineage(self, incident_id: str, depth: int = 5) -> List[str]:
+        lin = [incident_id]
+        curr = incident_id
+        for _ in range(depth):
+            pred = [e.source_incident for e in self.edges
+                   if e.target_incident == curr and e.source_incident not in lin]
+            if not pred:
+                break
+            curr = pred[0]
+            lin.append(curr)
+        return lin
+    
     def add_resolved(self, incident: IncidentMemory):
         self.incidents.append(incident)
-
+    
     def find_similar(self, signature: str, threshold: float = 0.6) -> List[IncidentMemory]:
-        # Normalize identity matching through the shared core helper
-        query = {"signature": signature}
-        out = []
-        for inc in self.incidents:
-            if same_incident(query, {"signature": inc.error_signature, "service": inc.service}):
-                out.append(inc)
-        return out
+        return [i for i in self.incidents if i.error_signature == signature or i.service in signature]
+    
+    def _detect_relationships(self, new_inc: IncidentNode) -> None:
+        if not self.nodes or len(self.nodes) == 1:
+            return
+        recent = max((nd for n, nd in self.nodes.items() if n != new_inc.incident_id),
+                    key=lambda x: x.timestamp, default=None)
+        if not recent:
+            return
+        if recent.dominant_service == new_inc.dominant_service:
+            self.edges.append(IncidentEdge(recent.incident_id, new_inc.incident_id, 'recurring', 0.8))
+        if new_inc.blast_radius > recent.blast_radius:
+            self.edges.append(IncidentEdge(recent.incident_id, new_inc.incident_id, 'escalation',
+                                          min(1.0, new_inc.blast_radius / 10.0)))
+        if recent.topology_hash == new_inc.topology_hash:
+            self.edges.append(IncidentEdge(recent.incident_id, new_inc.incident_id, 'similar', 0.9))
+    
+    def _save_to_disk(self) -> None:
+        with _lock:
+            INCIDENT_GRAPH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = {'nodes': {nid: asdict(nd) for nid, nd in self.nodes.items()},
+                   'edges': [{'source_incident': e.source_incident, 'target_incident': e.target_incident,
+                             'relationship': e.relationship, 'confidence': e.confidence} for e in self.edges]}
+            INCIDENT_GRAPH_FILE.write_text(json.dumps(data, indent=2, default=str))
+    
+    def _load_from_disk(self) -> None:
+        with _lock:
+            if not INCIDENT_GRAPH_FILE.exists():
+                return
+            try:
+                data = json.loads(INCIDENT_GRAPH_FILE.read_text())
+                for nid, nd_data in data.get('nodes', {}).items():
+                    self.nodes[nid] = IncidentNode(**nd_data)
+                for ed in data.get('edges', []):
+                    self.edges.append(IncidentEdge(**ed))
+                logger.info(f"Loaded {len(self.nodes)} incidents, {len(self.edges)} edges")
+            except Exception as e:
+                logger.error(f"Failed to load incident graph: {e}")
 
-
-# Singleton
 _graph: Optional[IncidentGraph] = None
 
 

@@ -24,7 +24,6 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 COLLECTIONS = {
     "github": "github_code",
     "github_issues": "github_issues",
-    "linear": "github_issues",  # Map Linear to github_issues
     "slack": "slack_threads",
     "all": "all_context",
 }
@@ -36,7 +35,7 @@ class ChromaClient:
     
     Provides methods to search for:
     - Related code from GitHub
-    - Related issues from GitHub/Linear
+    - Related issues from GitHub Issues
     - Discussions from Slack
     - Combined search across all sources
     """
@@ -93,7 +92,7 @@ class ChromaClient:
             query: Search query string
             source_filter: Optional source filter:
                 - "github" → github_code
-                - "linear" → github_issues
+                - "github_issues" → github_issues
                 - "slack" → slack_threads
                 - None → all_context
             limit: Maximum number of results
@@ -104,8 +103,8 @@ class ChromaClient:
         # Map source filter to collection name
         if source_filter == "github":
             collection_name = COLLECTIONS["github"]
-        elif source_filter == "linear":
-            collection_name = COLLECTIONS["linear"]
+        elif source_filter == "github_issues":
+            collection_name = COLLECTIONS["github_issues"]
         elif source_filter == "slack":
             collection_name = COLLECTIONS["slack"]
         else:
