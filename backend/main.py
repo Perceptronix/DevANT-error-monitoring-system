@@ -32,6 +32,9 @@ from sources import get_data_source, get_available_sources
 from samples import get_sample_errors
 from pipeline import ErrorClusterer, ContextSearcher, ErrorAnalyzer, get_action_executor
 from core.scoring import severity_priority
+from repository.repo_analyzer import analyze_repository
+from repository.analysis_state import create_run, set_run_result, set_run_error, get_run
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -550,6 +553,37 @@ async def run_demo(config: PipelineConfig):
     # Run pipeline in background task
     asyncio.create_task(run_pipeline(config))
     return {"status": "started", "message": "Pipeline started. Connect to WebSocket for updates."}
+
+
+class RepoAnalyzeRequest(BaseModel):
+    repo_url: str
+    local_path: str | None = None
+
+
+@app.post("/api/analyze-repository")
+async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
+    """Start async repository analysis. Returns run_id. For remote repos, provide local_path to avoid cloning."""
+    run_id = create_run(req.repo_url)
+
+    async def _bg():
+        try:
+            # progress callback simple logger
+            def progress(step, payload):
+                # could broadcast over WS in future
+                pass
+
+            result = analyze_repository(req.repo_url, local_path=req.local_path, progress_callback=progress)
+            set_run_result(run_id, result)
+        except Exception as e:
+            set_run_error(run_id, str(e))
+
+    asyncio.create_task(_bg())
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/api/analyze-repository/{run_id}")
+async def get_analysis(run_id: str):
+    return get_run(run_id)
 
 
 @app.websocket("/ws/pipeline")
