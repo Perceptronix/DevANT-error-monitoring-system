@@ -12,6 +12,7 @@ export type JobState =
 export interface MinimalSnapshot {
   state: JobState
   transitions?: Array<unknown>
+  partial?: Record<string, unknown>
 }
 
 export function isTerminalState(state: JobState | undefined): boolean {
@@ -24,5 +25,17 @@ export function shouldApplySnapshot(current: MinimalSnapshot | null, incoming: M
 
   if (isTerminalState(current?.state)) return false
   if (incomingCount < currentCount) return false
-  return true
+  
+  // Allow update if transition count increased
+  if (incomingCount > currentCount) return true
+  
+  // Even if transition count is the same, allow update if partial data changed
+  const currentPartialSig = JSON.stringify(current?.partial || {})
+  const incomingPartialSig = JSON.stringify(incoming.partial || {})
+  if (currentPartialSig !== incomingPartialSig) return true
+  
+  // Allow update if state changed
+  if (current?.state !== incoming.state) return true
+  
+  return false
 }

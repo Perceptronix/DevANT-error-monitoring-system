@@ -25,13 +25,13 @@ _backend_dir = str(Path(__file__).parent.parent)
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
- from core.signal_fusion import SignalFusionEngine, SignalType
- from core.topology_propagation import TopologyPropagationEngine
- from memory.incident_graph import IncidentGraph, IncidentNode
- import hashlib
- 
- logger = logging.getLogger(__name__)
- _incident_graph = IncidentGraph()  # Persistent temporal memory
+from core.signal_fusion import SignalFusionEngine, SignalType
+from core.topology_propagation import TopologyPropagationEngine
+from memory.incident_graph import IncidentGraph, IncidentNode
+import hashlib
+
+logger = logging.getLogger(__name__)
+_incident_graph = IncidentGraph()  # Persistent temporal memory
 
 
 def _read_file_safe(path: Path, max_bytes: int = 16_384) -> str:
@@ -443,6 +443,9 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
             # Build topology from sampled manifests minimal
             topology = TopologyExtractor().extract_from_local_path(path) if path else {'services': [], 'edges': []}
             
+            # Emit topology progress event (triggers ANALYZING state transition)
+            progress('topology', {'topology': topology, 'concurrent': True})
+            
             # Topology propagation analysis
             propagation_engine = TopologyPropagationEngine()
             propagation_result = propagation_engine.analyze(topology_graph=topology)
@@ -581,7 +584,23 @@ def analyze_repository(repo_url: str, local_path: Optional[str] = None, progress
                 'conflict_count': fusion_result.get('conflict_count', 0),
             })
             result.update({'scanned': True, 'evidence': evidence, 'topology': topology, 'scores': scores})
-            progress('completed', {'result_summary': {'services': len(evidence.get('services', [])), 'scores': scores}})
+            
+            # AI Synthesis Layer
+            try:
+                from pipeline.synthesis_engine import SynthesisEngine
+                synth_engine = SynthesisEngine()
+                synthesis = synth_engine.synthesize(
+                    evidence=evidence,
+                    topology=topology,
+                    scores=scores,
+                    propagation=evidence.get('propagation', {})
+                )
+                result['synthesis'] = synthesis
+            except Exception as e:
+                logger.error(f"Synthesis integration failed: {e}")
+                result['synthesis'] = None
+            
+            progress('completed', {'result_summary': {'services': len(evidence.get('services', [])), 'scores': scores, 'synthesis': result.get('synthesis')}})
             # finalize run deterministically
             try:
                 if run_id:

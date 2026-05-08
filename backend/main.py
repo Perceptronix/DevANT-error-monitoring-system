@@ -40,6 +40,9 @@ from repository.analysis_state import (
     get_run_snapshot,
     cancel_run,
     list_runs,
+    transition_run,
+    set_partial_update,
+    finalize_run,
 )
 
 # Configure logging
@@ -572,28 +575,95 @@ class RepoAnalyzeRequest(BaseModel):
 async def analyze_repository_endpoint(req: RepoAnalyzeRequest):
     """Start async repository analysis. Returns run_id. For remote repos, provide local_path to avoid cloning."""
     run_id = create_run(req.repo_url)
+    logger.info(f"[{run_id}] Analysis created for: {req.repo_url}")
 
     async def _bg():
         try:
-            # progress callback simple logger
-            def progress(step, payload):
-                return None
-
+            logger.info(f"[{run_id}] BG TASK STARTED")
+            
             loop = asyncio.get_event_loop()
 
             def _sync():
-                def progress(step, payload):
-                    return None
-
-                analyze_repository(
-                    req.repo_url,
-                    local_path=req.local_path,
-                    progress_callback=progress,
-                    run_id=run_id,
-                )
+                logger.info(f"[{run_id}] SYNC EXECUTOR RUNNING")
+                
+                # Create real progress callback that updates run state
+                def progress_callback(step: str, payload: dict):
+                    """Progress callback that emits state transitions and partial updates."""
+                    logger.info(f"[{run_id}] PROGRESS: step={step}")
+                    
+                    # Map steps to canonical stage IDs (matches repo_analyzer.py mapping)
+                    step_to_stage = {
+                        'started': 'repository_ingestion',
+                        'github_ingest_started': 'repository_ingestion',
+                        'github_sample': 'repository_ingestion',
+                        'scanned_files': 'repository_ingestion',
+                        'workflows_extracted': 'workflow_discovery',
+                        'deployments_correlated': 'deployment_analysis',
+                        'observability_checked': 'observability_analysis',
+                        'topology': 'topology_inference',
+                        'regression_checked': 'regression_risk_analysis',
+                        'scored': 'operational_scoring',
+                        'confidence_calibrated': 'confidence_calibration',
+                        'completed': 'final_operational_synthesis',
+                        'error': 'final_operational_synthesis',
+                    }
+                    stage_id = step_to_stage.get(step, step)
+                    
+                    # Update run state based on step
+                    try:
+                        if step == 'started':
+                            transition_run(run_id, 'INITIALIZING', f'Started {stage_id}')
+                        elif step in ('github_sample', 'scanned_files'):
+                            transition_run(run_id, 'INGESTING', f'Progress in {stage_id}')
+                        elif step == 'topology':
+                            transition_run(run_id, 'ANALYZING', f'Progress in {stage_id}')
+                        elif step == 'scored':
+                            transition_run(run_id, 'SCORING', f'Progress in {stage_id}')
+                        elif step == 'completed':
+                            transition_run(run_id, 'FINALIZING', f'Completed {stage_id}')
+                        elif step == 'error':
+                            transition_run(run_id, 'FAILED', f'Error in {stage_id}')
+                    except Exception as e:
+                        logger.error(f"[{run_id}] Failed to transition state for step {step}: {e}")
+                    
+                    # Store partial update for progressive UI rendering
+                    try:
+                        set_partial_update(run_id, stage_id, {
+                            'stage': stage_id,
+                            'step': step,
+                            'progress': payload,
+                        })
+                        logger.info(f"[{run_id}] Updated partial: {stage_id}")
+                    except Exception as e:
+                        logger.error(f"[{run_id}] Failed to set partial update for {stage_id}: {e}")
+                
+                try:
+                    logger.info(f"[{run_id}] Calling analyze_repository()...")
+                    result = analyze_repository(
+                        req.repo_url,
+                        local_path=req.local_path,
+                        progress_callback=progress_callback,
+                        run_id=run_id,
+                    )
+                    logger.info(f"[{run_id}] analyze_repository() completed.")
+                    logger.info(f"[{run_id}] Result: scanned={result.get('scanned')}, error={result.get('error')}, evidence_keys={list(result.get('evidence', {}).keys())}")
+                    logger.info(f"[{run_id}] Scores: {result.get('scores')}")
+                    
+                    # Finalize run with result
+                    try:
+                        finalize_run(run_id, result)
+                        logger.info(f"[{run_id}] Run finalized successfully")
+                    except Exception as e:
+                        logger.error(f"[{run_id}] Failed to finalize run: {e}")
+                    
+                except Exception as e:
+                    logger.exception(f"[{run_id}] Exception in _sync(): {e}")
+                    raise
 
             await loop.run_in_executor(None, _sync)
+            logger.info(f"[{run_id}] BG TASK COMPLETED SUCCESSFULLY")
         except Exception as e:
+            logger.error(f"[{run_id}] BG TASK FAILED: {e}", exc_info=True)
             fail_run(run_id, str(e))
 
     asyncio.create_task(_bg())
@@ -635,10 +705,22 @@ async def stream_analysis(run_id: str):
                 yield "event: error\ndata: {\"error\":\"not_found\"}\n\n"
                 break
 
+            # Create signature including partial values to detect any changes
+            partial_sigs = {}
+            for stage_id, partial_data in (snap.get("partial") or {}).items():
+                if isinstance(partial_data, dict):
+                    # Include evidence/progress values to detect updates
+                    partial_sigs[stage_id] = json.dumps({
+                        'state': partial_data.get('state'),
+                        'progress_keys': sorted(list((partial_data.get('progress') or {}).keys())) if partial_data.get('progress') else [],
+                        'evidence_keys': sorted(list((partial_data.get('evidence') or {}).keys())) if partial_data.get('evidence') else [],
+                    }, sort_keys=True)
+            
             sig = json.dumps({
                 "state": snap.get("state"),
                 "transitions": len(snap.get("transitions", [])),
                 "partial_keys": sorted(list((snap.get("partial") or {}).keys())),
+                "partial_sigs": partial_sigs,
                 "result": bool(snap.get("result_snapshot")),
             }, sort_keys=True)
 

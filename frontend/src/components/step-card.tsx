@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { ChevronDown, ChevronRight, Check, Loader2, Clock, AlertCircle, ArrowRight } from 'lucide-react'
+import Icons from '@/lib/icons'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -55,10 +55,10 @@ export function StepCard({ step, isActive, autoExpand = false, forceOpen = false
   }, [step.status])
 
   const statusIcon = {
-    pending: <Clock className="h-4 w-4 text-muted-foreground" />,
-    running: <Loader2 className="h-4 w-4 text-primary animate-spin" />,
-    completed: <Check className="h-4 w-4 text-green-500" />,
-    error: <AlertCircle className="h-4 w-4 text-destructive" />,
+    pending: <Icons.Clock className="h-4 w-4 text-muted-foreground" />,
+    running: <Icons.Loader2 className="h-4 w-4 text-primary animate-spin" />,
+    completed: <Icons.Check className="h-4 w-4 text-green-500" />,
+    error: <Icons.AlertCircle className="h-4 w-4 text-destructive" />,
   }
 
   const statusBadge = {
@@ -268,10 +268,10 @@ function RawErrorsData({ data }: { data: Record<string, unknown> }) {
                   <span className="text-cyan-400">{error.module}</span>
                   <span className="text-gray-500">→</span>
                   <span className="text-purple-400">{error.function}</span>
-                  {error.line && (
+                      {error.line && (
                     <>
                       <span className="text-gray-500">:</span>
-                      <span className="text-orange-400">{error.line}</span>
+                      <span className="text-accent">{error.line}</span>
                     </>
                   )}
                 </div>
@@ -402,7 +402,7 @@ function ClusteringData({ data }: { data: Record<string, unknown> }) {
     { bg: 'bg-blue-500/20', border: 'border-blue-500/40', text: 'text-blue-400', bar: 'bg-blue-500' },
     { bg: 'bg-purple-500/20', border: 'border-purple-500/40', text: 'text-purple-400', bar: 'bg-purple-500' },
     { bg: 'bg-emerald-500/20', border: 'border-emerald-500/40', text: 'text-emerald-400', bar: 'bg-emerald-500' },
-    { bg: 'bg-orange-500/20', border: 'border-orange-500/40', text: 'text-orange-400', bar: 'bg-orange-500' },
+    { bg: 'bg-accent-soft', border: 'border-accent-soft', text: 'text-accent', bar: 'bg-accent' },
     { bg: 'bg-pink-500/20', border: 'border-pink-500/40', text: 'text-pink-400', bar: 'bg-pink-500' },
   ]
   
@@ -785,10 +785,10 @@ function AnalysisData({ data }: { data: Record<string, unknown> }) {
   }, {} as Record<string, number>)
 
   const severityConfig: Record<string, { bg: string; border: string; text: string; icon: string; label: string }> = {
-    S1: { bg: 'bg-red-500/10', border: 'border-red-500/30', text: 'text-red-500', icon: '🔴', label: 'Critical' },
-    S2: { bg: 'bg-orange-500/10', border: 'border-orange-500/30', text: 'text-orange-500', icon: '🟠', label: 'High' },
-    S3: { bg: 'bg-yellow-500/10', border: 'border-yellow-500/30', text: 'text-yellow-500', icon: '🟡', label: 'Medium' },
-    S4: { bg: 'bg-blue-500/10', border: 'border-blue-500/30', text: 'text-blue-500', icon: '🔵', label: 'Low' },
+    S1: { bg: 'bg-red-500/10', border: 'border-red-500/30', text: 'text-red-500', icon: '', label: 'Critical' },
+    S2: { bg: 'bg-accent-soft', border: 'border-accent-soft', text: 'text-accent', icon: '', label: 'High' },
+    S3: { bg: 'bg-yellow-500/10', border: 'border-yellow-500/30', text: 'text-yellow-500', icon: '', label: 'Medium' },
+    S4: { bg: 'bg-blue-500/10', border: 'border-blue-500/30', text: 'text-blue-500', icon: '', label: 'Low' },
   }
   
   // Stagger class helper
@@ -797,10 +797,10 @@ function AnalysisData({ data }: { data: Record<string, unknown> }) {
   return (
     <div className="space-y-4">
       {/* Severity summary */}
-      <div className="p-4 bg-gradient-to-r from-amber-500/10 to-red-500/10 rounded-lg border border-amber-500/20 animate-fade-in">
+      <div className="p-4 bg-accent-gradient rounded-lg border border-accent-soft animate-fade-in">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <ShieldAlertIcon className="h-5 w-5 text-amber-400" />
+            <ShieldAlertIcon className="h-5 w-5 text-accent" />
             <span className="font-medium">Severity Analysis</span>
           </div>
           <span className="text-sm text-muted-foreground">{analyses.length} issue{analyses.length !== 1 ? 's' : ''} analyzed</span>
@@ -900,8 +900,8 @@ function AnalysisData({ data }: { data: Record<string, unknown> }) {
 
               {/* Impact */}
               <div className="flex gap-3">
-                <div className="w-8 h-8 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center justify-center flex-shrink-0">
-                  <ZapIcon className="h-4 w-4 text-orange-400" />
+                <div className="w-8 h-8 rounded-lg bg-accent-soft border border-accent-soft flex items-center justify-center flex-shrink-0">
+                  <ZapIcon className="h-4 w-4 text-accent" />
                 </div>
                 <div className="flex-1">
                   <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1">Impact</div>
@@ -1007,15 +1007,15 @@ function AlertPreviewData({ data }: { data: Record<string, unknown> }) {
   }>
 
   const severityEmoji: Record<string, string> = {
-    S1: '🔴',
-    S2: '🟠', 
-    S3: '🟡',
-    S4: '🔵',
+    S1: '',
+    S2: '',
+    S3: '',
+    S4: '',
   }
 
   const priorityColors: Record<string, string> = {
     S1: 'bg-red-500',
-    S2: 'bg-orange-500',
+    S2: 'bg-accent',
     S3: 'bg-yellow-500',
     S4: 'bg-blue-500',
   }
@@ -1065,7 +1065,8 @@ function AlertPreviewData({ data }: { data: Record<string, unknown> }) {
                 <div className="px-3 pb-3 pl-14">
                   {/* Header block */}
                   <div className="text-white font-bold text-[15px] mb-2">
-                    {severityEmoji[alert.severity]} {alert.severity}: {alert.title.slice(0, 50)}
+                    <Icons.AlertTriangle className="inline-block h-4 w-4 mr-2 text-accent" />
+                    {alert.severity}: {alert.title.slice(0, 50)}
                   </div>
                   
                   {/* Section with colored border */}
@@ -1151,7 +1152,7 @@ function AlertPreviewData({ data }: { data: Record<string, unknown> }) {
                     <span className={cn(
                       "px-2 py-0.5 text-[11px] rounded",
                       alert.severity === 'S1' && "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400",
-                      alert.severity === 'S2' && "bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400",
+                      alert.severity === 'S2' && "bg-accent-soft dark:bg-accent-soft text-accent dark:text-accent",
                       alert.severity === 'S3' && "bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400",
                       alert.severity === 'S4' && "bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400",
                     )}>
