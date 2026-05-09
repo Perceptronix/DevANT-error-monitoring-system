@@ -1,44 +1,26 @@
 """
 Context Enrichment Engine — dynamically attach operational context to error clusters.
-
-For each error cluster, searches and attaches:
-- Related GitHub code and commits
-- Related GitHub issues and discussions
-- Pull requests that touched affected services
-- Slack thread discussions
-- Historical incident context
-- Known mitigations and fixes
-
-All lookups are async, non-blocking, and gracefully degrade when integrations
-are unavailable.
-
-Concurrency is limited with a semaphore to prevent:
-- Connection pool exhaustion
-- API rate limit violations
-- Unbounded memory growth
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from connectors.github_connector import GitHubConnector
 from connectors.slack_connector import SlackConnector
+from memory.incident_graph import get_incident_graph
 
 logger = logging.getLogger(__name__)
 
-# Concurrency limit: max 10 parallel enrichment tasks per orchestrator instance
 _ENRICHMENT_SEMAPHORE_LIMIT = 10
 
 
 @dataclass
 class ContextAttachment:
-    """A single piece of enrichment context."""
-    type: str  # "commit", "issue", "pr", "slack", "historical"
-    source: str  # "github", "slack", "incident_graph"
+    type: str
+    source: str
     title: str
     url: Optional[str] = None
     timestamp: Optional[str] = None
@@ -50,7 +32,6 @@ class ContextAttachment:
 
 @dataclass
 class EnrichedCluster:
-    """An error cluster augmented with context."""
     cluster_id: str
     root_cause: str
     affected_services: List[str]
@@ -64,31 +45,17 @@ class EnrichedCluster:
 
 
 class ContextEnricher:
-    """
-    Async context enrichment engine.
-    
-    Attaches operational context to error clusters by querying:
-    - GitHub API (commits, issues, PRs)
-    - Slack API (thread search, channel history)
-    - Historical incident database
-    """
-
     def __init__(
         self,
         github_token: Optional[str] = None,
         slack_token: Optional[str] = None,
-        incident_graph: Optional[Dict[str, Any]] = None,
+        incident_graph: Optional[Any] = None,
     ):
         self.github = GitHubConnector(token=github_token)
         self.slack = SlackConnector(token=slack_token)
-        self.incident_graph = incident_graph or {}
+        self.incident_graph = incident_graph or get_incident_graph()
         self._cache: Dict[str, List[ContextAttachment]] = {}
-        # Limit concurrent enrichment tasks to prevent resource exhaustion
         self._semaphore = asyncio.Semaphore(_ENRICHMENT_SEMAPHORE_LIMIT)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     async def enrich_cluster(
         self,
@@ -96,68 +63,29 @@ class ContextEnricher:
         repo_url: Optional[str] = None,
         services: Optional[List[str]] = None,
     ) -> EnrichedCluster:
-        """
-        Enrich a cluster with con with concurrency limit:
-        1. GitHub commits
-        2. GitHub issues
-        3. GitHub PRs
-        4. Slack discussions
-        5. Historical incidents
-        
-        Uses semaphore to prevent unbounded concurrency.
-        """
         enriched = EnrichedCluster(
-            cluster_id=cluster.get("cluster_id", "unknown"),
-            root_cause=cluster.get("root_cause", ""),
-            affected_services=cluster.get("affected_services", []),
-            severity=cluster.get("severity", "S4"),
-            error_count=cluster.get("error_count", 0),
-            confidence=cluster.get("confidence", 0.0),
-            deployment_related=cluster.get("deployment_related", False),
-            regression_probability=cluster.get("regression_probability", 0.0),
+            cluster_id=str(cluster.get("cluster_id", "unknown")),
+            root_cause=str(cluster.get("root_cause", "")),
+            affected_services=list(cluster.get("affected_services", []) or []),
+            severity=str(cluster.get("severity", "S4")),
+            error_count=int(cluster.get("error_count", 0) or 0),
+            confidence=float(cluster.get("confidence", 0.0) or 0.0),
+            deployment_related=bool(cluster.get("deployment_related", False)),
+            regression_probability=float(cluster.get("regression_probability", 0.0) or 0.0),
         )
-        
-        # Wrap all enrichment tasks with semaphore
-        async def bounded_enrich(coro):
-            async with self._semaphore:
-                return await coro
-        
-        # Run all enrichment tasks in parallel with concurrency limit
+
         tasks = []
-        
-        if repo_url:
-            tasks.append(
-                bounded_enrich(
-                    self._enrich_github_context(enriched, repo_url, services or [])
-                )
-            )
-        
+        if repo_url and self.github.is_configured:
+            tasks.append(self._bounded(self._enrich_github_context(enriched, repo_url, services or [])))
         if self.slack.is_configured:
-            tasks.append(
-                bounded_enrich(
-                    self._enrich_slack_context(enriched, cluster.get("root_cause", ""))
-                )
-            )
-        
+            tasks.append(self._bounded(self._enrich_slack_context(enriched, cluster)))
         if self.incident_graph:
-            tasks.append(
-                bounded_enrich(
-                    self._enrich_historical_context(enriched, cluster)
-                
-            tasks.append(
-                self._enrich_historical_context(enriched, cluster)
-            )
-        
-        if 
-        Enrich multiple clusters in parallel.
-        
-        Uses semaphore internally to prevent unbounded concurrency.
-        
+            tasks.append(self._bounded(self._enrich_historical_context(enriched, cluster)))
+
+        if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Suggest action based on context
+
         enriched.suggested_action = self._suggest_action(enriched)
-        
         return enriched
 
     async def enrich_batch(
@@ -165,229 +93,128 @@ class ContextEnricher:
         clusters: List[Dict[str, Any]],
         repo_url: Optional[str] = None,
     ) -> List[EnrichedCluster]:
-        """Enrich multiple clusters in parallel."""
-        tasks = [
-            self.enrich_cluster(c, repo_url=repo_url)
-            for c in clusters
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter out exceptions
-        enriched = [r for r in results if isinstance(r, EnrichedCluster)]
-        
-        return enriched
+        results = await asyncio.gather(
+            *(self.enrich_cluster(cluster, repo_url=repo_url) for cluster in clusters),
+            return_exceptions=True,
+        )
+        return [result for result in results if isinstance(result, EnrichedCluster)]
 
-    # ------------------------------------------------------------------
-    # Enrichment strategies
-    # ------------------------------------------------------------------
+    async def _bounded(self, coro):
+        async with self._semaphore:
+            return await coro
 
-    async def _enrich_github_context(
-        self,
-        enriched: EnrichedCluster,
-        repo_url: str,
-        services: List[str],
-    ):
-        """Search GitHub for related commits, issues, and PRs."""
-        if not self.github.is_configured:
-            return
-        
+    async def _enrich_github_context(self, enriched: EnrichedCluster, repo_url: str, services: List[str]) -> None:
         try:
-            # Parallel GitHub searches with timeouts
-            commits_task = asyncio.wait_for(
-                asyncio.to_thread(
-                    self.github.get_recent_commits,
-                    repo_url,
-                    since_hours=24,
-                    max_commits=10,
-                ),
-                timeout=10.0,  # ← TIMEOUT ADDED
-            )
-            
-            issues_task = asyncio.wait_for(
-                asyncio.to_thread(
-                    self.github.search_related_issues,
-                    repo_url,
-                    enriched.root_cause,
-                    max_issues=5,
-                ),
-                timeout=10.0,  # ← TIMEOUT ADDED
-            )
-            
-            prs_task = asyncio.wait_for(
-                asyncio.to_thread(
-                    self.github.search_prs_by_service,
-                    repo_url,
-                    services,
-                    since_hours=24,
-                    max_prs=5,
-                ),
-                timeout=10.0,  # ← TIMEOUT ADDED
-            )
-            
-            commits, issues, prs = await asyncio.gather(
-                commits_task,
-                issues_task,
-                prs_task,
-                return_exceptions=True,
-            )
-            
-            # Attach commits
+            commits_task = asyncio.to_thread(self.github.get_recent_commits, repo_url, 24, 10)
+            issues_task = asyncio.to_thread(self.github.search_related_issues, repo_url, enriched.root_cause, 5)
+            prs_task = asyncio.to_thread(self.github.search_prs_by_service, repo_url, services, 24, 5)
+            commits, issues, prs = await asyncio.gather(commits_task, issues_task, prs_task, return_exceptions=True)
+
             if isinstance(commits, list):
                 for commit in commits:
-                    enriched.context_attachments.append(
-                        ContextAttachment(
-                            type="commit",
-                            source="github",
-                            title=commit.get("message", "Unnamed commit"),
-                            url=commit.get("url", ""),
-                            timestamp=commit.get("date", ""),
-                            author=commit.get("author", ""),
-                            relevance_score=0.6,
-                            snippet=commit.get("sha", "")[:12],
-                        )
-                    )
-            
-            # Attach issues
+                    enriched.context_attachments.append(ContextAttachment(
+                        type="commit",
+                        source="github",
+                        title=commit.get("message", "Unnamed commit"),
+                        url=commit.get("url", ""),
+                        timestamp=commit.get("date", ""),
+                        author=commit.get("author", ""),
+                        relevance_score=0.6,
+                        snippet=(commit.get("sha", "") or "")[:12],
+                    ))
+
             if isinstance(issues, list):
                 for issue in issues:
-                    enriched.context_attachments.append(
-                        ContextAttachment(
-                            type="issue",
-                            source="github",
-                            title=issue.get("title", "Unnamed issue"),
-                            url=issue.get("url", ""),
-                            timestamp=issue.get("updated_at", ""),
-                            author=issue.get("author", ""),
-                            relevance_score=0.7,
-                            snippet=issue.get("body", "")[:200],
-                        )
-                    )
-            
-            # Attach PRs
+                    enriched.context_attachments.append(ContextAttachment(
+                        type="issue",
+                        source="github",
+                        title=issue.get("title", "Unnamed issue"),
+                        url=issue.get("url", ""),
+                        timestamp=issue.get("updated_at", ""),
+                        author=issue.get("author", ""),
+                        relevance_score=0.5,
+                        snippet=issue.get("body", "")[:180],
+                    ))
+
             if isinstance(prs, list):
                 for pr in prs:
-                    enriched.context_attachments.append(
-                        ContextAttachment(
-                            type="pr",
-                            source="github",
-                            title=pr.get("title", "Unnamed PR"),
-                            url=pr.get("url", ""),
-                            timestamp=pr.get("created_at", ""),
-                            author=pr.get("author", ""),
-                            relevance_score=0.5,
-                            snippet=pr.get("files_changed", 0),
-                        )
-                    )
-        
-        except Exception as e:
-            logger.warning(f"GitHub enrichment failed: {e}")
+                    enriched.context_attachments.append(ContextAttachment(
+                        type="pr",
+                        source="github",
+                        title=pr.get("title", "Unnamed PR"),
+                        url=pr.get("url", ""),
+                        timestamp=pr.get("merged_at", ""),
+                        author=pr.get("author", ""),
+                        relevance_score=0.7,
+                        snippet=f"Files changed: {pr.get('changed_files', 0)}",
+                    ))
+        except Exception as exc:
+            logger.warning("GitHub context enrichment failed: %s", exc)
 
-    async def _enrich_slack_context(
-        self,
-        enriched: EnrichedCluster,
-        query: str,
-    ):
-        """Search Slack for related discussions."""
-        if not self.slack.is_configured:
-            return
-        
+    async def _enrich_slack_context(self, enriched: EnrichedCluster, cluster: Dict[str, Any]) -> None:
         try:
-            # Search Slack with timeout
-            messages = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.slack.search_messages,
-                    query,
-                    since_minutes=1440,
-                    limit=5,
-                ),
-                timeout=8.0,  # ← TIMEOUT ADDED
-            )
-            
-            for msg in messages or []:
-                enriched.context_attachments.append(
-                    ContextAttachment(
-                        type="slack",
-                        source="slack",
-                        title=f"Discussion: {msg.get('text', '')[:100]}",
-                        timestamp=msg.get("ts", ""),
-                        author=msg.get("user", ""),
+            query = enriched.root_cause or cluster.get("signature", "")
+            if not query:
+                return
+            messages = await self.slack.search_messages(query, since_minutes=1440, limit=5)
+            for message in messages[:5]:
+                enriched.context_attachments.append(ContextAttachment(
+                    type="slack",
+                    source="slack",
+                    title=message.get("text", "Slack message")[:120],
+                    url=message.get("permalink") or message.get("url", ""),
+                    timestamp=message.get("ts", ""),
+                    author=message.get("user", ""),
+                    relevance_score=0.45,
+                    snippet=message.get("text", "")[:180],
+                ))
+        except Exception as exc:
+            logger.warning("Slack context enrichment failed: %s", exc)
+
+    async def _enrich_historical_context(self, enriched: EnrichedCluster, cluster: Dict[str, Any]) -> None:
+        try:
+            if hasattr(self.incident_graph, "find_similar"):
+                matches = self.incident_graph.find_similar(cluster.get("signature", enriched.root_cause))
+                for match in matches[:5]:
+                    if isinstance(match, dict):
+                        title = str(match.get("incident_id", "Historical incident"))
+                        timestamp = str(match.get("timestamp", ""))
+                        snippet = str(match.get("resolution", match.get("root_cause", "")))
+                    else:
+                        title = str(getattr(match, "incident_id", "Historical incident"))
+                        timestamp = str(getattr(match, "timestamp", ""))
+                        snippet = str(getattr(match, "resolution", ""))
+                    enriched.context_attachments.append(ContextAttachment(
+                        type="historical",
+                        source="incident_graph",
+                        title=title,
+                        timestamp=timestamp,
+                        relevance_score=0.55,
+                        snippet=snippet[:180],
+                    ))
+                    enriched.regression_probability = min(1.0, enriched.regression_probability + 0.1)
+            elif isinstance(self.incident_graph, dict):
+                history = self.incident_graph.get("incidents", [])
+                for entry in history[:5]:
+                    enriched.context_attachments.append(ContextAttachment(
+                        type="historical",
+                        source="incident_graph",
+                        title=str(entry.get("incident_id", "Historical incident")),
+                        timestamp=str(entry.get("timestamp", "")),
                         relevance_score=0.5,
-                        snippet=msg.get("text", "")[:200],
-                        metadata={
-                            "channel": msg.get("channel"),
-                            "thread_ts": msg.get("thread_ts"),
-                        },
-                    )
-                )
-        except asyncio.TimeoutError:
-            logger.warning("Slack enrichment timed out")
-        except Exception as e:
-            logger.warning(f"Slack enrichment failed: {e}")
-
-    async def _enrich_historical_context(
-        self,
-        enriched: EnrichedCluster,
-        cluster: Dict[str, Any],
-    ):
-        """Attach historical incident context."""
-        try:
-            # Search incident graph for similar incidents
-            signatures = cluster.get("error_signatures", [])
-            
-            # Find matching historical incidents
-            for incident_id, incident in self.incident_graph.items():
-                incident_sigs = set(incident.get("signatures", []))
-                current_sigs = set(signatures)
-                
-                if incident_sigs & current_sigs:  # Signature overlap
-                    enriched.context_attachments.append(
-                        ContextAttachment(
-                            type="historical",
-                            source="incident_graph",
-                            title=f"Historical: {incident.get('root_cause', 'Previous incident')}",
-                            timestamp=incident.get("timestamp", ""),
-                            author=incident.get("owner", ""),
-                            relevance_score=0.8,
-                            snippet=incident.get("resolution", "Unresolved"),
-                            metadata={
-                                "incident_id": incident_id,
-                                "resolution": incident.get("resolution"),
-                                "mttr_minutes": incident.get("mttr_minutes"),
-                            },
-                        )
-                    )
-        
-        except Exception as e:
-            logger.warning(f"Historical enrichment failed: {e}")
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+                        snippet=str(entry.get("root_cause", ""))[:180],
+                    ))
+        except Exception as exc:
+            logger.warning("Historical context enrichment failed: %s", exc)
 
     def _suggest_action(self, enriched: EnrichedCluster) -> str:
-        """Generate a suggested action based on enriched context."""
-        # Look for prior resolutions in context
-        historical_attachments = [
-            a for a in enriched.context_attachments
-            if a.type == "historical"
-        ]
-        
-        if historical_attachments:
-            resolution = historical_attachments[0].metadata.get("resolution")
-            if resolution:
-                return f"Apply prior fix: {resolution}"
-        
-        # Default suggestion based on severity
-        if enriched.severity == "S1":
-            return "Escalate immediately. Investigate root cause and rollback if needed."
-        elif enriched.severity == "S2":
-            return "Page on-call engineer. Begin incident investigation."
-        elif enriched.severity == "S3":
-            return "Create incident ticket. Schedule investigation."
-        else:
-            return "Monitor trend. Investigate if error count increases."
-    
-    def _cache_key(self, cluster_id: str) -> str:
-        """Generate cache key for enrichment."""
-        return f"enrichment:{cluster_id}:{datetime.now(timezone.utc).date()}"
+        if enriched.deployment_related:
+            return "Check recent deployment diff and consider rollback"
+        if enriched.severity in ("S1", "S2"):
+            return "Escalate to on-call and inspect high-signal attachments"
+        if enriched.context_attachments:
+            return "Review attached commits, issues, and messages for shared failure pattern"
+        return "Investigate failing service path and compare with prior incidents"
+
+
+__all__ = ["ContextEnricher", "EnrichedCluster", "ContextAttachment"]

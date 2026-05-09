@@ -319,6 +319,211 @@ class GitHubConnector:
         
         return out
 
+    def get_deployments(
+        self,
+        repo_url: str,
+        environment: str = "production",
+        per_page: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent deployments for a repo and environment.
+        
+        Returns list of deployment dicts: {id, sha, ref, environment, created_at, updated_at, creator_login, description, task}
+        """
+        if not self.is_configured:
+            return []
+        
+        parsed = _parse_repo(repo_url)
+        if not parsed:
+            return []
+        owner, repo = parsed
+        
+        deployments = self._get(
+            f"/repos/{owner}/{repo}/deployments",
+            params={"environment": environment, "per_page": per_page}
+        )
+        if not isinstance(deployments, list):
+            return []
+        
+        out = []
+        for d in deployments:
+            out.append({
+                "id": d.get("id"),
+                "sha": d.get("sha", ""),
+                "ref": d.get("ref", ""),
+                "environment": d.get("environment", ""),
+                "created_at": d.get("created_at", ""),
+                "updated_at": d.get("updated_at", ""),
+                "creator_login": (d.get("creator") or {}).get("login", ""),
+                "description": d.get("description", ""),
+                "task": d.get("task", ""),
+            })
+        
+        return out
+
+    def get_deployment_statuses(
+        self,
+        repo_url: str,
+        deployment_id: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get statuses for a specific deployment.
+        
+        Returns list of status dicts: {id, state, log_url, description, environment, created_at, creator_login}
+        Statuses are ordered newest-first.
+        """
+        if not self.is_configured:
+            return []
+        
+        parsed = _parse_repo(repo_url)
+        if not parsed:
+            return []
+        owner, repo = parsed
+        
+        statuses = self._get(
+            f"/repos/{owner}/{repo}/deployments/{deployment_id}/statuses"
+        )
+        if not isinstance(statuses, list):
+            return []
+        
+        out = []
+        for s in statuses:
+            out.append({
+                "id": s.get("id"),
+                "state": s.get("state", ""),
+                "log_url": s.get("log_url", ""),
+                "description": s.get("description", ""),
+                "environment": s.get("environment", ""),
+                "created_at": s.get("created_at", ""),
+                "creator_login": (s.get("creator") or {}).get("login", ""),
+            })
+        
+        return out
+
+    def get_commit_diff(
+        self,
+        repo_url: str,
+        sha: str,
+    ) -> Dict[str, Any]:
+        """
+        Get commit metadata and file diff info.
+        
+        Returns dict: {sha, message, author_name, author_date, files_changed, additions, deletions, files}
+        where files is a list of {filename, status, additions, deletions, patch}
+        """
+        if not self.is_configured:
+            return {}
+        
+        parsed = _parse_repo(repo_url)
+        if not parsed:
+            return {}
+        owner, repo = parsed
+        
+        result = self._get(f"/repos/{owner}/{repo}/commits/{sha}")
+        if not isinstance(result, dict):
+            return {}
+        
+        commit = result.get("commit", {})
+        stats = result.get("stats", {})
+        files = result.get("files", [])
+        
+        return {
+            "sha": result.get("sha", ""),
+            "message": commit.get("message", "").split("\n")[0] if commit.get("message") else "",
+            "author_name": (commit.get("author") or {}).get("name", ""),
+            "author_date": (commit.get("author") or {}).get("date", ""),
+            "files_changed": len(files),
+            "additions": stats.get("additions", 0),
+            "deletions": stats.get("deletions", 0),
+            "files": [
+                {
+                    "filename": f.get("filename", ""),
+                    "status": f.get("status", ""),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", "")[:500],
+                }
+                for f in files[:50]
+            ]
+        }
+
+    def get_workflow_runs(
+        self,
+        repo_url: str,
+        branch: str = "main",
+        per_page: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get workflow runs (CI/CD) for a repo.
+        
+        Returns only failed or in_progress runs.
+        Each dict: {id, name, status, conclusion, head_sha, head_branch, created_at, updated_at, html_url, logs_url}
+        """
+        if not self.is_configured:
+            return []
+        
+        parsed = _parse_repo(repo_url)
+        if not parsed:
+            return []
+        owner, repo = parsed
+        
+        result = self._get(
+            f"/repos/{owner}/{repo}/actions/runs",
+            params={"branch": branch, "per_page": per_page, "event": "push"}
+        )
+        if not isinstance(result, dict):
+            return []
+        
+        runs = result.get("workflow_runs", [])
+        out = []
+        
+        for run in runs:
+            # Only include failed or in_progress runs
+            if run.get("conclusion") == "failure" or run.get("status") == "in_progress":
+                out.append({
+                    "id": run.get("id"),
+                    "name": run.get("name", ""),
+                    "status": run.get("status", ""),
+                    "conclusion": run.get("conclusion"),
+                    "head_sha": run.get("head_sha", ""),
+                    "head_branch": run.get("head_branch", ""),
+                    "created_at": run.get("created_at", ""),
+                    "updated_at": run.get("updated_at", ""),
+                    "html_url": run.get("html_url", ""),
+                    "logs_url": run.get("logs_url", ""),
+                })
+        
+        return out
+
+    def fetch_log_text(
+        self,
+        log_url: str,
+        max_chars: int = 8000,
+    ) -> str:
+        """
+        Fetch log text from a full URL (e.g., Vercel, Render, GitHub Actions logs).
+        
+        Returns decoded text, truncated to max_chars from the END (end has failure reason).
+        Returns empty string on any error.
+        """
+        if not log_url:
+            return ""
+        
+        try:
+            import urllib.request
+            import urllib.parse
+            
+            req = urllib.request.Request(log_url, headers=self._headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode('utf-8', errors='replace')
+                # Truncate from the end to preserve error messages
+                if len(text) > max_chars:
+                    text = text[-max_chars:]
+                return text
+        except Exception as exc:
+            logger.warning(f"Failed to fetch log from {log_url}: {exc}")
+            return ""
+
     # ------------------------------------------------------------------
     # Internal HTTP helper
     # ------------------------------------------------------------------

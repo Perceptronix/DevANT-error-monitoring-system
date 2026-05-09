@@ -171,6 +171,16 @@ class LegacySlackConfig(LegacyIntegrationConfig):
 
 
 @dataclass
+class WebhookConfig:
+    """GitHub webhook configuration."""
+    secret: Optional[str] = None
+    
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.secret)
+
+
+@dataclass
 class Config:
     """
     Main application configuration.
@@ -192,6 +202,9 @@ class Config:
     
     # Data source (sample by default)
     data_source: DataSourceConfig = field(default_factory=DataSourceConfig)
+    
+    # GitHub webhook
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)
     
     @classmethod
     def from_env(cls) -> "Config":
@@ -253,8 +266,12 @@ class Config:
         cfg.slack = LegacySlackConfig(
             enabled=os.getenv("SLACK_ENABLED", "false").lower() == "true",
             api_key=os.getenv("SLACK_BOT_TOKEN"),
-            channel_id=os.getenv("SLACK_CHANNEL_ID"),
+            channel_id=os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_ALERT_CHANNEL", "#devant-alerts"),
             signing_secret=os.getenv("SLACK_SIGNING_SECRET"),
+        )
+
+        cfg.webhook = WebhookConfig(
+            secret=os.getenv("GITHUB_WEBHOOK_SECRET"),
         )
 
         return cfg

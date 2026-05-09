@@ -6,6 +6,7 @@ from .identity import incident_identity, deployment_identity, same_incident
 from .normalization import normalize_signature, normalize_text, normalize_timestamp
 from .scoring import (
     combine_evidence_score,
+    assess_operational_severity,
     infer_severity,
     severity_priority,
     severity_emoji,
@@ -22,6 +23,7 @@ __all__ = [
     "normalize_text",
     "normalize_timestamp",
     "combine_evidence_score",
+    "assess_operational_severity",
     "infer_severity",
     "severity_priority",
     "severity_emoji",

@@ -16,11 +16,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -33,6 +34,7 @@ from samples import get_sample_errors
 from pipeline import ErrorClusterer, ContextSearcher, ErrorAnalyzer, get_action_executor
 from core.scoring import severity_priority
 from repository.repo_analyzer import analyze_repository
+from app.api.routes.health_routes import router as health_router
 from repository.analysis_state import (
     create_run,
     fail_run,
@@ -47,6 +49,50 @@ from repository.analysis_state import (
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# --- Pipeline results storage ---
+import hashlib
+import hmac
+from typing import Dict
+
+# In-memory store for latest pipeline results per repo
+# Key: repo_full_name (e.g. "Nandeesh71/watchtoower")
+_pipeline_results: Dict[str, Dict] = {}
+
+
+async def _run_error_pipeline_bg(
+    repo_full_name: str,
+    environment: str,
+    log_url: Optional[str],
+) -> None:
+    """Background task: runs error pipeline and stores result."""
+    try:
+        from pipeline.error_pipeline import run_error_pipeline
+        
+        # Convert owner/repo to full GitHub URL
+        repo_url = f"https://github.com/{repo_full_name}"
+        
+        result = await run_error_pipeline(
+            repo_url=repo_url,
+            environment=environment,
+            log_url=log_url,
+        )
+        
+        _pipeline_results[repo_full_name] = result
+        logger.info(
+            f"[{repo_full_name}] Pipeline done — "
+            f"failures={result.get('has_failures')}, "
+            f"alerted={result.get('alerted')}"
+        )
+    except Exception as exc:
+        logger.error(f"[{repo_full_name}] Background pipeline error: {exc}", exc_info=True)
+        _pipeline_results[repo_full_name] = {
+            "repo": repo_full_name,
+            "error": str(exc),
+            "has_failures": False,
+            "alerted": False,
+        }
 
 
 # --- Removed old Pipeline Execution and ConnectionManager ---
@@ -170,6 +216,8 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.include_router(health_router)
+
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
@@ -178,107 +226,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {
-        "status": "ok",
-        "service": "Error Monitoring Agent Demo",
-        "version": "1.0.0"
-    }
-
-
-@app.get("/api/config")
-async def get_app_config():
-    """
-    Get current configuration status.
-    
-    Returns detailed information about:
-    - Airweave configuration
-    - LLM provider
-    - Data source (sample, azure, sentry, etc.)
-    - Integration status (GitHub Issues, Slack)
-    - State storage stats
-    """
-    config = get_config()
-    state = get_state_manager()
-    
-    # Get data source info
-    data_source = get_data_source()
-    available_sources = get_available_sources()
-    
-    # Mark active source
-    for name, info in available_sources.items():
-        info["active"] = (name == data_source.source_type)
-    
-    return {
-        # Basic status (for backwards compatibility)
-        "airweave_configured": config.airweave.is_configured,
-        "openai_configured": bool(config.llm.openai_api_key),
-        "anthropic_configured": bool(config.llm.anthropic_api_key),
-        "llm_provider": config.llm.provider,
-        
-        # Detailed configuration
-        "airweave": {
-            "configured": config.airweave.is_configured,
-            "collection_id": config.airweave.collection_id[:8] + "..." if config.airweave.collection_id else None,
-        },
-        "llm": {
-            "configured": config.llm.is_configured,
-            "provider": config.llm.provider,
-            "model": config.llm.model,
-        },
-        "data_source": {
-            "active": data_source.name,
-            "type": data_source.source_type,
-            "available": available_sources,
-        },
-        "integrations": {
-            "github_issues": {
-                "enabled": config.github.enabled,
-                "configured": config.github.is_configured,
-                "owner": config.github.owner,
-                "repo": config.github.repo,
-                "mode": "live" if config.github.is_configured else "preview",
-            },
-            "slack": {
-                "enabled": config.slack.enabled,
-                "configured": config.slack.is_configured,
-                "mode": "live" if config.slack.is_configured else "preview",
-            },
-        },
-        "state": state.get_stats(),
-    }
-
-
-@app.get("/api/samples")
-async def get_samples():
-    """Get sample error data."""
-    return {
-        "samples": get_sample_errors(include_extended=True),
-        "count": len(get_sample_errors(include_extended=True))
-    }
-
-
-@app.get("/api/state")
-async def get_state():
-    """
-    Get current state storage information.
-    
-    Returns statistics and recent signatures for debugging/admin.
-    """
-    state = get_state_manager()
-    signatures = state.get_all_signatures()
-    mutes = state.get_active_mutes()
-    
-    return {
-        "stats": state.get_stats(),
-        "recent_signatures": list(signatures.keys())[-10:],  # Last 10
-        "active_mutes": list(mutes.keys()),
-    }
-
 
 class MuteRequest(BaseModel):
     """Request to mute an error signature."""
@@ -493,8 +440,196 @@ async def stream_analysis(run_id: str):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ====================================================================
+# DEPLOYMENT FAILURE DETECTION: GitHub Webhook + Live Errors Endpoints
+# ====================================================================
 
 
+@app.post("/webhook/github")
+async def github_webhook(request: Request):
+    """
+    Receives GitHub deployment_status and push webhook events.
+    
+    GitHub sends this whenever:
+    - A deployment changes state (success, failure, error)
+    - A push is made to any branch
+    
+    Setup: In your GitHub repo → Settings → Webhooks → Add webhook
+    Payload URL: https://your-devant-server/webhook/github
+    Content type: application/json
+    Events: Deployment statuses, Pushes
+    Secret: Set GITHUB_WEBHOOK_SECRET in your .env
+    """
+    # Read raw body for HMAC validation
+    body = await request.body()
+    
+    # Validate HMAC signature if secret is configured
+    webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+    if webhook_secret:
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if not sig_header.startswith("sha256="):
+            logger.warning("Webhook received without X-Hub-Signature-256 header")
+            raise HTTPException(status_code=401, detail="Missing signature")
+        
+        expected_sig = "sha256=" + hmac.new(
+            webhook_secret.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+        
+        # Use hmac.compare_digest to prevent timing attacks
+        if not hmac.compare_digest(expected_sig, sig_header):
+            logger.warning("Webhook HMAC validation failed")
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    # Parse event type
+    event_type = request.headers.get("X-GitHub-Event", "")
+    
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    
+    repo_full_name = payload.get("repository", {}).get("full_name", "")
+    if not repo_full_name:
+        return {"status": "ignored", "reason": "no repository in payload"}
+    
+    # Handle deployment_status events
+    if event_type == "deployment_status":
+        state = payload.get("deployment_status", {}).get("state", "")
+        environment = payload.get("deployment", {}).get("environment", "production")
+        log_url = payload.get("deployment_status", {}).get("log_url", "")
+        
+        logger.info(
+            f"Deployment status event: {repo_full_name} | "
+            f"env={environment} | state={state}"
+        )
+        
+        # Only process failure and error states
+        if state in ("failure", "error"):
+            asyncio.create_task(
+                _run_error_pipeline_bg(repo_full_name, environment, log_url)
+            )
+            return {"status": "processing", "repo": repo_full_name, "state": state}
+        
+        return {"status": "ignored", "reason": f"state={state} not a failure"}
+    
+    # Handle push events — scan for failures after any push
+    elif event_type == "push":
+        ref = payload.get("ref", "")
+        # Only process pushes to main/master
+        if ref in ("refs/heads/main", "refs/heads/master"):
+            logger.info(f"Push event to main: {repo_full_name}")
+            asyncio.create_task(
+                _run_error_pipeline_bg(repo_full_name, "production", None)
+            )
+            return {"status": "processing", "repo": repo_full_name, "event": "push"}
+        return {"status": "ignored", "reason": f"push to {ref} (not main/master)"}
+    
+    # Ping event — GitHub sends this when webhook is first created
+    elif event_type == "ping":
+        return {"status": "pong", "message": "DevANT webhook connected successfully"}
+    
+    # All other events
+    return {"status": "ignored", "event": event_type}
+
+
+class ScanRequest(BaseModel):
+    repo_url: str
+    environment: str = "production"
+
+
+@app.post("/api/scan-repo")
+async def trigger_scan(req: ScanRequest):
+    """
+    Manually trigger deployment failure scan for a repo.
+    
+    Use this to test without waiting for a webhook, or to scan on demand.
+    Returns run_id immediately; check /api/live-errors/{repo} for result.
+    """
+    # Extract owner/repo from URL
+    parsed = None
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", req.repo_url)
+    if m:
+        parsed = f"{m.group(1)}/{m.group(2)}"
+    else:
+        m2 = re.match(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$", req.repo_url)
+        if m2:
+            parsed = req.repo_url
+    
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid repo URL or owner/repo format")
+    
+    asyncio.create_task(
+        _run_error_pipeline_bg(parsed, req.environment, None)
+    )
+    
+    return {
+        "status": "scanning",
+        "repo": parsed,
+        "environment": req.environment,
+        "check_result_at": f"/api/live-errors/{parsed}",
+    }
+
+
+@app.get("/api/live-errors/{repo_full_name:path}")
+async def get_live_errors(repo_full_name: str):
+    """
+    Get the latest error scan result for a repo.
+    
+    Returns the most recent pipeline result, or status=no_data if not scanned yet.
+    """
+    result = _pipeline_results.get(repo_full_name)
+    if not result:
+        return {
+            "status": "no_data",
+            "repo": repo_full_name,
+            "message": "No scan has run yet. Trigger one via POST /api/scan-repo or wait for a webhook.",
+        }
+    return result
+
+
+@app.get("/api/live-errors/{repo_full_name:path}/stream")
+async def stream_live_errors(repo_full_name: str):
+    """
+    SSE stream for live error scan results.
+    
+    Emits an update event when the pipeline result changes.
+    Closes automatically when result arrives (one-shot stream).
+    Frontend connects to this after triggering /api/scan-repo.
+    """
+    async def event_generator():
+        last_sig = None
+        poll_count = 0
+        max_polls = 120  # 2 minutes max (120 * 1s)
+        
+        while poll_count < max_polls:
+            result = _pipeline_results.get(repo_full_name)
+            
+            if result:
+                # Build a change signature
+                sig = f"{result.get('has_failures')}:{result.get('pipeline_completed_at', '')}:{result.get('error', '')}"
+                
+                if sig != last_sig:
+                    payload = json.dumps(result)
+                    yield f"event: update\ndata: {payload}\n\n"
+                    last_sig = sig
+                    
+                    # If pipeline is done (has result), close after sending
+                    if result.get("pipeline_completed_at") or result.get("error"):
+                        yield "event: done\ndata: {}\n\n"
+                        break
+            else:
+                # Still scanning
+                yield f"event: scanning\ndata: {{\"repo\": \"{repo_full_name}\", \"status\": \"scanning\"}}\n\n"
+            
+            poll_count += 1
+            await asyncio.sleep(1)
+        
+        if poll_count >= max_polls:
+            yield "event: timeout\ndata: {{\"error\": \"scan timeout\"}}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn

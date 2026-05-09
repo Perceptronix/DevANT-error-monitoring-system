@@ -27,6 +27,10 @@ class IncidentMemory:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     status: str = "open"
     historical_matches: List[str] = field(default_factory=list)
+    deployment_lineage: List[str] = field(default_factory=list)
+    recurring_cluster_id: Optional[str] = None
+    temporal_drift_score: float = 0.0
+    affected_services: List[str] = field(default_factory=list)
 
 @dataclass
 class IncidentNode:
@@ -92,6 +96,23 @@ class IncidentGraph:
         return {'is_recurring': len(matched) >= 2, 'matched_incidents': matched[:10],
                 'pattern_type': pattern_types[0] if pattern_types else None,
                 'recurrence_count': len(matched), 'confidence': min(1.0, len(matched) / 5.0) if matched else 0.0}
+
+    def detect_recurring_deployment_failures(self, service: str, deployment_id: str) -> Dict[str, Any]:
+        related = [incident for incident in self.incidents if incident.service == service and incident.deployment_id == deployment_id]
+        return {
+            'is_recurring': len(related) >= 2,
+            'deployment_id': deployment_id,
+            'service': service,
+            'occurrence_count': len(related),
+            'incident_ids': [incident.incident_id for incident in related[:10]],
+            'confidence': min(1.0, len(related) / 4.0) if related else 0.0,
+        }
+
+    def track_deployment_failure_lineage(self, incident_id: str) -> List[str]:
+        lineage = self.get_incident_lineage(incident_id, depth=8)
+        if incident_id not in lineage:
+            lineage.insert(0, incident_id)
+        return lineage
     
     def analyze_operational_drift(self, repo: str) -> Dict[str, Any]:
         repo_inc = [n for n in self.nodes.values() if n.repo == repo]
@@ -120,6 +141,18 @@ class IncidentGraph:
         return {'has_drift': drift > 0.3, 'blast_radius_trend': trend_r, 'confidence_trend': trend_c,
                 'regression_trend': trend_g, 'topology_instability': topo_inst,
                 'recent_incidents': recent, 'drift_score': drift}
+
+    def summarize_regression_tracking(self, repo: str) -> Dict[str, Any]:
+        repo_incidents = [node for node in self.nodes.values() if node.repo == repo]
+        recurring = [node.incident_id for node in repo_incidents if self.detect_recurring_patterns(node)['is_recurring']]
+        return {
+            'repo': repo,
+            'tracked_incidents': len(repo_incidents),
+            'recurring_incidents': recurring[:20],
+            'recurring_count': len(recurring),
+            'lineage_depth': max((len(self.get_incident_lineage(node.incident_id)) for node in repo_incidents), default=0),
+            'drift_score': self.analyze_operational_drift(repo)['drift_score'] if repo_incidents else 0.0,
+        }
     
     def find_historical_similarity(self, incident: IncidentNode, threshold: float = 0.7) -> List[Dict]:
         sims = []
@@ -148,6 +181,7 @@ class IncidentGraph:
         return lin
     
     def add_resolved(self, incident: IncidentMemory):
+        incident.deployment_lineage = incident.deployment_lineage or ([incident.deployment_id] if incident.deployment_id else [])
         self.incidents.append(incident)
     
     def find_similar(self, signature: str, threshold: float = 0.6) -> List[IncidentMemory]:

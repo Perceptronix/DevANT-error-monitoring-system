@@ -293,6 +293,123 @@ class SlackConnector:
             logger.warning(f"Slack get_channel_info failed: {exc}")
             return {}
 
+    async def post_alert(
+        self,
+        failure_result: Dict[str, Any],
+        channel: Optional[str] = None,
+    ) -> bool:
+        """
+        Post a deployment failure alert to Slack.
+        
+        Uses Block Kit format with severity emoji and structured layout.
+        """
+        if not self.is_configured:
+            logger.warning("Slack not configured, skipping alert")
+            return False
+        
+        # Default channel
+        if not channel:
+            channel = os.environ.get("SLACK_ALERT_CHANNEL", "#devant-alerts")
+        
+        try:
+            # Severity emoji and top cluster
+            severity_emoji = {"S1": "🔴", "S2": "🟠", "S3": "🟡", "S4": "🔵"}
+            
+            clusters = failure_result.get("clusters", [])
+            top_cluster = clusters[0] if clusters else {}
+            severity = top_cluster.get("severity", "S3")
+            emoji = severity_emoji.get(severity, "⚪")
+            
+            failed = failure_result.get("failed_deployments", [])
+            repo = failure_result.get("repo", "unknown")
+            environment = failure_result.get("environment", "production")
+            
+            # Build Block Kit message
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{emoji} {severity} Deployment Failure — {repo.split('/')[-1]}",
+                        "emoji": True,
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Repository:*\n{repo}"},
+                        {"type": "mrkdwn", "text": f"*Environment:*\n{environment}"},
+                        {"type": "mrkdwn", "text": f"*Failed Deployments:*\n{len(failed)}"},
+                        {"type": "mrkdwn", "text": f"*Severity:*\n{severity}"},
+                    ]
+                },
+            ]
+            
+            # Add each failed deployment as a section (max 3)
+            for f in failed[:3]:
+                sha = f.get("sha_short", "unknown")
+                msg = f.get("commit_message", "No message")[:80]
+                files = f.get("files_changed", 0)
+                changed = ", ".join(f.get("changed_files", [])[:3]) or "unknown files"
+                log_url = f.get("log_url", "")
+                link = f" <{log_url}|View Logs>" if log_url else ""
+                
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Commit `{sha}`:* {msg}\n"
+                            f"*Files changed:* {files} ({changed}){link}"
+                        )
+                    }
+                })
+            
+            # Add root cause from top cluster
+            if top_cluster.get("root_cause"):
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Root Cause Analysis:*\n{top_cluster.get('root_cause', '')[:200]}"
+                    }
+                })
+            
+            # Footer
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"DevANT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                    }
+                ]
+            })
+            
+            payload = {
+                "channel": channel,
+                "blocks": blocks,
+                "text": f"{emoji} Deployment failure in {repo} ({severity})",  # fallback
+            }
+            
+            # Post to Slack
+            result = await self._request(
+                "POST",
+                "/chat.postMessage",
+                json_body=payload,
+            )
+            
+            if not isinstance(result, dict) or not result.get("ok"):
+                logger.warning(f"Slack post_alert failed: {result.get('error', 'unknown')}")
+                return False
+            
+            logger.info(f"Posted alert to {channel}")
+            return True
+
+        except Exception as exc:
+            logger.error(f"Slack post_alert exception: {exc}", exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # Low-level request logic
     # ------------------------------------------------------------------

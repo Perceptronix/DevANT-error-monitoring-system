@@ -1,44 +1,34 @@
 """
-Root Cause Clustering Engine — intelligent error grouping and analysis.
+Root Cause Clustering Engine — semantic error grouping and operational analysis.
 
-Clusters errors by:
-1. Stack trace similarity (exact and fuzzy matching)
-2. Exception fingerprint + service
-3. Semantic embedding similarity
-4. Deployment correlation
-5. Service topology overlap
-6. Temporal clustering (recurring patterns)
-
-Output clusters contain:
-- root_cause: LLM-generated diagnosis
-- affected_services: impacted backend services
-- frequency: error occurrence count
-- severity: S1-S4 derived from impact
-- regression_probability: likelihood of regression
-- deployment_related: correlated with deployment?
-- confidence: overall analysis confidence
-- historical_context: prior incidents
+This keeps the public RootCauseClusterer API stable while replacing the
+exact-signature-first flow with hybrid semantic clustering based on:
+- embeddings
+- stacktrace/fingerprint similarity
+- deployment context
+- temporal proximity
 """
 from __future__ import annotations
 
-import logging
 import hashlib
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from core.embeddings_cache import get_embedder
+from core.normalization import normalize_text, normalize_timestamp
+from intelligence.root_cause_engine import RootCauseEngine
+from memory.operational_fingerprint import OperationalFingerprintEngine
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ErrorCluster:
-    """Represents a grouped set of related errors."""
     cluster_id: str
     root_cause: str
     affected_services: List[str]
@@ -46,7 +36,7 @@ class ErrorCluster:
     error_count: int
     affected_orgs: List[str]
     severity: str
-    frequency_trend: str  # "increasing" | "stable" | "decreasing"
+    frequency_trend: str
     regression_probability: float
     deployment_related: bool
     deployment_ids: List[str] = field(default_factory=list)
@@ -55,453 +45,484 @@ class ErrorCluster:
     last_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     topology_affected: List[str] = field(default_factory=list)
     evidence_score: float = 0.0
+    signature: str = ""
+    operational_severity: str = "informational"
+    semantic_similarity: float = 0.0
+    stacktrace_similarity: float = 0.0
+    deployment_context: float = 0.0
+    temporal_proximity: float = 0.0
+    historical_recurrence: float = 0.0
+    signal_types: List[str] = field(default_factory=list)
+    representative_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    centroid_text: str = ""
 
 
 class RootCauseClusterer:
-    """
-    Production-grade error clustering engine.
-    
-    Combines multiple similarity metrics:
-    - Stack trace parsing and normalization
-    - Semantic embedding similarity
-    - Exception fingerprinting
-    - Service topology correlation
-    - Temporal pattern recognition
-    """
+    """Production-grade error clustering engine."""
 
-    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2", embedder: Optional[Any] = None):
         self.embedding_model_name = embedding_model
-        # Use global cached embedder — loads only once, reused across all requests
-        self._embedder = get_embedder(embedding_model)
-        
+        self._embedder = embedder if embedder is not None else get_embedder(embedding_model)
+        self._fingerprints = OperationalFingerprintEngine()
+        self._root_cause_engine = RootCauseEngine(embedding_model=embedding_model, embedder=embedder)
         self._cluster_cache: Dict[str, ErrorCluster] = {}
         self._signature_to_clusters: Dict[str, str] = {}
         self._deployment_map: Dict[str, List[str]] = defaultdict(list)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def cluster_errors(
         self,
         errors: List[Dict[str, Any]],
         deployment_info: Optional[Dict[str, Any]] = None,
     ) -> List[ErrorCluster]:
-        """
-        Cluster a list of errors into root cause groups.
-        
-        Input errors should have:
-        {
-            id, signature, service, stack_trace, exception_type,
-            timestamp, affected_orgs, metadata
-        }
-        
-        Returns list of ErrorCluster objects sorted by severity.
-        """
         if not errors:
             return []
 
-        clusters: Dict[str, ErrorCluster] = {}
-        
-        # Build signature to errors mapping
-        signature_to_errors: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for error in errors:
-            sig = error.get("signature", "unknown")
-            signature_to_errors[sig].append(error)
-        
-        # Phase 1: Group by exact signature
-        for signature, sig_errors in signature_to_errors.items():
-            cluster = self._cluster_by_signature(signature, sig_errors, deployment_info)
-            clusters[cluster.cluster_id] = cluster
-        
-        # Phase 2: Merge highly similar clusters
-        merged_clusters = self._merge_similar_clusters(list(clusters.values()))
-        
-        # Phase 3: Correlate with deployments
+        prepared = [self._prepare_error(error, deployment_info) for error in errors]
+        clusters = self._build_hybrid_clusters(prepared)
+
         if deployment_info:
-            merged_clusters = self._correlate_deployments(merged_clusters, deployment_info)
-        
-        # Phase 4: Rank by severity and return
-        merged_clusters.sort(
+            clusters = self._correlate_deployments(clusters, deployment_info)
+
+        for cluster in clusters:
+            hypothesis = self._root_cause_engine.analyze_cluster(self._cluster_to_payload(cluster))
+            cluster.root_cause = hypothesis.likely_cause
+            cluster.operational_severity = hypothesis.severity
+            cluster.severity = self._map_operational_severity(hypothesis.severity)
+            cluster.confidence = max(cluster.confidence, hypothesis.confidence)
+            cluster.historical_recurrence = max(cluster.historical_recurrence, hypothesis.recurrence_score)
+            cluster.representative_evidence = (cluster.representative_evidence + hypothesis.evidence[:5])[:10]
+            cluster.signature = cluster.signature or (cluster.error_signatures[0] if cluster.error_signatures else cluster.root_cause)
+            cluster.historical_matches = list(dict.fromkeys(cluster.historical_matches))
+
+        clusters.sort(
             key=lambda c: (
                 self._severity_rank(c.severity),
                 -c.error_count,
                 -c.confidence,
             )
         )
-        
-        return merged_clusters
+        return clusters
 
     def update_cluster_history(
         self,
         cluster: ErrorCluster,
         historical_incidents: List[Dict[str, Any]],
     ) -> ErrorCluster:
-        """
-        Update cluster with historical context.
-        
-        Identifies if this is a recurring incident.
-        """
         if not historical_incidents:
             return cluster
-        
-        matches = self._find_historical_matches(
-            cluster.root_cause,
-            cluster.error_signatures,
-            historical_incidents,
-        )
-        
-        cluster.historical_matches = [m["incident_id"] for m in matches]
-        
-        # Bump regression probability if repeated
+
+        matches = self._find_historical_matches(cluster, historical_incidents)
+        cluster.historical_matches = [match["incident_id"] for match in matches if match.get("incident_id")]
         if len(matches) >= 2:
             cluster.regression_probability = min(1.0, cluster.regression_probability + 0.3)
-        
+            cluster.historical_recurrence = min(1.0, cluster.historical_recurrence + 0.3)
         return cluster
 
-    # ------------------------------------------------------------------
-    # Clustering logic
-    # ------------------------------------------------------------------
+    def _prepare_error(self, error: Dict[str, Any], deployment_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        prepared = dict(error)
+        prepared["_cluster_text"] = normalize_text(" ".join(str(part) for part in [
+            error.get("signature"),
+            error.get("message"),
+            error.get("stack_trace"),
+            error.get("stacktrace"),
+            error.get("error_type"),
+            error.get("exception_type"),
+            " ".join(error.get("changed_files", []) or []),
+            error.get("commit_message"),
+            error.get("deployment_message"),
+        ] if part))
+        prepared["_timestamp"] = normalize_timestamp(error.get("timestamp")) or datetime.now(timezone.utc)
+        prepared["_fingerprint"] = self._fingerprints.fingerprint_incident(error)
+        prepared["_deployment_info"] = deployment_info or {}
+        return prepared
 
-    def _cluster_by_signature(
-        self,
-        signature: str,
-        errors: List[Dict[str, Any]],
-        deployment_info: Optional[Dict[str, Any]] = None,
-    ) -> ErrorCluster:
-        """Create a cluster for errors with the same signature."""
-        if not errors:
-            raise ValueError("Cannot cluster empty error list")
-        
-        # Generate cluster ID
-        cluster_id = f"cluster_{hashlib.md5(signature.encode()).hexdigest()[:12]}"
-        
-        # Extract common attributes
-        services = list(set(e.get("service", "unknown") for e in errors))
-        orgs = list(set(
-            org for e in errors
-            for org in (e.get("affected_orgs", []) or [])
-        ))
-        
-        # Calculate frequency trend
-        trend = self._calculate_frequency_trend(errors)
-        
-        # Infer severity
-        severity = self._infer_severity(errors, services)
-        
-        # Estimate regression probability
-        regression_prob = self._estimate_regression_probability(errors)
-        
-        # Root cause (placeholder for LLM generation)
-        root_cause = self._generate_preliminary_root_cause(errors)
-        
-        # Topology analysis
-        topology_affected = self._analyze_topology(services)
-        
-        # Evidence score
-        evidence_score = self._compute_evidence_score(errors)
-        
+    def _build_hybrid_clusters(self, errors: List[Dict[str, Any]]) -> List[ErrorCluster]:
+        clusters: List[ErrorCluster] = []
+        for error in errors:
+            best_cluster = None
+            best_score = 0.0
+            for cluster in clusters:
+                score = self._error_cluster_similarity(error, cluster)
+                if score > best_score:
+                    best_cluster = cluster
+                    best_score = score
+
+            if best_cluster is not None and best_score >= 0.72:
+                self._attach_error(best_cluster, error, best_score)
+            else:
+                clusters.append(self._new_cluster(error))
+
+        return self._merge_similar_clusters(clusters)
+
+    def _new_cluster(self, error: Dict[str, Any]) -> ErrorCluster:
+        signature = error.get("signature") or error.get("message") or error.get("_fingerprint").normalized_signature
+        cluster_id = f"cluster_{hashlib.md5(signature.encode('utf-8')).hexdigest()[:12]}"
+        services = self._error_services(error)
+        orgs = list(dict.fromkeys(error.get("affected_orgs", []) or []))
+        root_cause = self._generate_preliminary_root_cause([error])
+        evidence_score = self._compute_evidence_score([error])
         return ErrorCluster(
             cluster_id=cluster_id,
             root_cause=root_cause,
             affected_services=services,
             error_signatures=[signature],
-            error_count=len(errors),
+            error_count=1,
             affected_orgs=orgs,
-            severity=severity,
-            frequency_trend=trend,
-            regression_probability=regression_prob,
-            deployment_related=False,  # Will be updated later
-            confidence=min(1.0, 0.8 + (evidence_score * 0.2)),
-            topology_affected=topology_affected,
+            severity=self._infer_severity([error], services),
+            frequency_trend="stable",
+            regression_probability=self._estimate_regression_probability([error]),
+            deployment_related=False,
+            confidence=min(1.0, 0.65 + (evidence_score * 0.25)),
+            topology_affected=services[:],
             evidence_score=evidence_score,
+            signature=signature,
+            centroid_text=error["_cluster_text"],
+            signal_types=[self._signal_type(error)],
+            representative_evidence=[self._cluster_evidence(error)],
+            last_seen=error["_timestamp"].isoformat(),
         )
+
+    def _attach_error(self, cluster: ErrorCluster, error: Dict[str, Any], similarity: float) -> None:
+        signature = error.get("signature") or error.get("message") or error.get("_fingerprint").normalized_signature
+        if signature not in cluster.error_signatures:
+            cluster.error_signatures.append(signature)
+        cluster.error_count += 1
+        cluster.affected_services = list(dict.fromkeys(cluster.affected_services + self._error_services(error)))
+        cluster.affected_orgs = list(dict.fromkeys(cluster.affected_orgs + (error.get("affected_orgs") or [])))
+        if error.get("deployment_id"):
+            cluster.deployment_ids = list(dict.fromkeys(cluster.deployment_ids + [error["deployment_id"]]))
+        if error.get("commit_sha"):
+            cluster.representative_evidence.append({"commit_sha": error.get("commit_sha")})
+        if error.get("changed_files"):
+            cluster.representative_evidence.append({"changed_files": error.get("changed_files")})
+        if error.get("stack_trace") or error.get("stacktrace"):
+            cluster.representative_evidence.append({"stack_trace": error.get("stack_trace") or error.get("stacktrace")})
+        cluster.representative_evidence = cluster.representative_evidence[:10]
+        cluster.confidence = min(1.0, max(cluster.confidence, similarity, self._confidence_from_error(error)))
+        cluster.evidence_score = min(1.0, max(cluster.evidence_score, self._compute_evidence_score([error])))
+        cluster.temporal_proximity = max(cluster.temporal_proximity, self._temporal_similarity(error, cluster))
+        cluster.stacktrace_similarity = max(cluster.stacktrace_similarity, self._stacktrace_similarity(error, cluster))
+        cluster.deployment_context = max(cluster.deployment_context, self._deployment_similarity(error, cluster))
+        cluster.semantic_similarity = max(cluster.semantic_similarity, self._semantic_similarity_text(error["_cluster_text"], cluster.centroid_text or cluster.root_cause))
+        cluster.historical_recurrence = min(1.0, cluster.historical_recurrence + (0.15 if cluster.error_count > 1 else 0.0))
+        cluster.last_seen = max(cluster.last_seen, error["_timestamp"].isoformat())
 
     def _merge_similar_clusters(self, clusters: List[ErrorCluster]) -> List[ErrorCluster]:
-        """Merge clusters with high semantic similarity."""
         if len(clusters) <= 1:
             return clusters
-        
-        # Calculate pairwise similarities
-        merged: Dict[str, ErrorCluster] = {}
-        processed = set()
-        
-        for i, cluster_a in enumerate(clusters):
-            if cluster_a.cluster_id in processed:
-                continue
-            
-            # Start a new merged cluster
-            merged_cluster = cluster_a
-            processed.add(cluster_a.cluster_id)
-            
-            # Find similar clusters to merge
-            for cluster_b in clusters[i + 1:]:
-                if cluster_b.cluster_id in processed:
-                    continue
-                
-                similarity = self._cluster_similarity(cluster_a, cluster_b)
-                if similarity > 0.75:  # High similarity threshold
-                    # Merge cluster_b into merged_cluster
-                    merged_cluster = self._merge_two_clusters(merged_cluster, cluster_b)
-                    processed.add(cluster_b.cluster_id)
-            
-            merged[merged_cluster.cluster_id] = merged_cluster
-        
-        return list(merged.values())
 
-    def _merge_two_clusters(
-        self,
-        cluster_a: ErrorCluster,
-        cluster_b: ErrorCluster,
-    ) -> ErrorCluster:
-        """Merge two error clusters."""
+        merged: List[ErrorCluster] = []
+        consumed = set()
+        for index, cluster in enumerate(clusters):
+            if index in consumed:
+                continue
+
+            current = cluster
+            for other_index in range(index + 1, len(clusters)):
+                if other_index in consumed:
+                    continue
+                other = clusters[other_index]
+                if self._cluster_similarity(current, other) >= 0.78:
+                    current = self._merge_two_clusters(current, other)
+                    consumed.add(other_index)
+            merged.append(current)
+
+        return merged
+
+    def _merge_two_clusters(self, cluster_a: ErrorCluster, cluster_b: ErrorCluster) -> ErrorCluster:
         return ErrorCluster(
-            cluster_id=cluster_a.cluster_id,  # Keep first ID
-            root_cause=cluster_a.root_cause,  # Will be regenerated by LLM
-            affected_services=list(set(cluster_a.affected_services + cluster_b.affected_services)),
-            error_signatures=list(set(cluster_a.error_signatures + cluster_b.error_signatures)),
+            cluster_id=cluster_a.cluster_id,
+            root_cause=cluster_a.root_cause,
+            affected_services=list(dict.fromkeys(cluster_a.affected_services + cluster_b.affected_services)),
+            error_signatures=list(dict.fromkeys(cluster_a.error_signatures + cluster_b.error_signatures)),
             error_count=cluster_a.error_count + cluster_b.error_count,
-            affected_orgs=list(set(cluster_a.affected_orgs + cluster_b.affected_orgs)),
+            affected_orgs=list(dict.fromkeys(cluster_a.affected_orgs + cluster_b.affected_orgs)),
             severity=self._merge_severities(cluster_a.severity, cluster_b.severity),
             frequency_trend="increasing" if cluster_a.error_count + cluster_b.error_count > 10 else "stable",
-            regression_probability=max(
-                cluster_a.regression_probability,
-                cluster_b.regression_probability,
-            ),
+            regression_probability=max(cluster_a.regression_probability, cluster_b.regression_probability),
             deployment_related=cluster_a.deployment_related or cluster_b.deployment_related,
-            deployment_ids=list(set(
-                cluster_a.deployment_ids + cluster_b.deployment_ids
-            )),
-            confidence=min(
-                cluster_a.confidence,
-                cluster_b.confidence,
-            ),
-            historical_matches=list(set(
-                cluster_a.historical_matches + cluster_b.historical_matches
-            )),
-            topology_affected=list(set(
-                cluster_a.topology_affected + cluster_b.topology_affected
-            )),
-            evidence_score=max(
-                cluster_a.evidence_score,
-                cluster_b.evidence_score,
-            ),
+            deployment_ids=list(dict.fromkeys(cluster_a.deployment_ids + cluster_b.deployment_ids)),
+            confidence=min(1.0, max(cluster_a.confidence, cluster_b.confidence)),
+            historical_matches=list(dict.fromkeys(cluster_a.historical_matches + cluster_b.historical_matches)),
+            last_seen=max(cluster_a.last_seen, cluster_b.last_seen),
+            topology_affected=list(dict.fromkeys(cluster_a.topology_affected + cluster_b.topology_affected)),
+            evidence_score=max(cluster_a.evidence_score, cluster_b.evidence_score),
+            signature=cluster_a.signature or cluster_b.signature,
+            operational_severity=cluster_a.operational_severity or cluster_b.operational_severity,
+            semantic_similarity=max(cluster_a.semantic_similarity, cluster_b.semantic_similarity),
+            stacktrace_similarity=max(cluster_a.stacktrace_similarity, cluster_b.stacktrace_similarity),
+            deployment_context=max(cluster_a.deployment_context, cluster_b.deployment_context),
+            temporal_proximity=max(cluster_a.temporal_proximity, cluster_b.temporal_proximity),
+            historical_recurrence=max(cluster_a.historical_recurrence, cluster_b.historical_recurrence),
+            signal_types=list(dict.fromkeys(cluster_a.signal_types + cluster_b.signal_types)),
+            representative_evidence=(cluster_a.representative_evidence + cluster_b.representative_evidence)[:10],
+            centroid_text=cluster_a.centroid_text or cluster_b.centroid_text,
         )
 
-    def _correlate_deployments(
-        self,
-        clusters: List[ErrorCluster],
-        deployment_info: Dict[str, Any],
-    ) -> List[ErrorCluster]:
-        """Mark clusters that correlate with recent deployments."""
+    def _correlate_deployments(self, clusters: List[ErrorCluster], deployment_info: Dict[str, Any]) -> List[ErrorCluster]:
         recent_deployments = deployment_info.get("recent_deployments", [])
         deployment_window_minutes = 30
-        
+
         for cluster in clusters:
             for deployment in recent_deployments:
                 if self._is_deployment_correlated(cluster, deployment, deployment_window_minutes):
                     cluster.deployment_related = True
-                    cluster.deployment_ids.append(deployment.get("id", ""))
+                    deployment_id = deployment.get("id", "")
+                    if deployment_id:
+                        cluster.deployment_ids.append(deployment_id)
+                    cluster.deployment_ids = list(dict.fromkeys(cluster.deployment_ids))
                     cluster.regression_probability = min(1.0, cluster.regression_probability + 0.2)
-        
+                    cluster.deployment_context = max(cluster.deployment_context, 0.85)
         return clusters
 
-    def _is_deployment_correlated(
-        self,
-        cluster: ErrorCluster,
-        deployment: Dict[str, Any],
-        window_minutes: int,
-    ) -> bool:
-        """Check if cluster errors are temporally close to deployment."""
-        # Parse timestamps
+    def _is_deployment_correlated(self, cluster: ErrorCluster, deployment: Dict[str, Any], window_minutes: int) -> bool:
         try:
-            cluster_time = datetime.fromisoformat(cluster.last_seen.replace("Z", "+00:00"))
-            deployment_time = datetime.fromisoformat(
-                deployment.get("timestamp", "").replace("Z", "+00:00")
-            )
-            
+            cluster_time = normalize_timestamp(cluster.last_seen)
+            deployment_time = normalize_timestamp(deployment.get("timestamp", ""))
+            if not cluster_time or not deployment_time:
+                return False
             time_diff = abs((cluster_time - deployment_time).total_seconds() / 60)
-            
-            # Also check service overlap
-            deployment_services = set(deployment.get("services", []))
+            deployment_services = set(deployment.get("services", []) or deployment.get("services_touched", []) or [])
             cluster_services = set(cluster.affected_services)
             service_overlap = bool(deployment_services & cluster_services)
-            
             return time_diff <= window_minutes and service_overlap
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Scoring and analysis utilities
-    # ------------------------------------------------------------------
-
     def _cluster_similarity(self, cluster_a: ErrorCluster, cluster_b: ErrorCluster) -> float:
-        """Calculate semantic similarity between two clusters."""
-        if not self._embedder:
-            # Fallback: service overlap only
-            services_a = set(cluster_a.affected_services)
-            services_b = set(cluster_b.affected_services)
-            overlap = len(services_a & services_b) / (len(services_a | services_b) + 1e-6)
-            return overlap
-        
-        try:
-            # Embed root causes
-            embedding_a = self._embedder.encode(cluster_a.root_cause)
-            embedding_b = self._embedder.encode(cluster_b.root_cause)
-            
-            # Cosine similarity
-            similarity = float(
-                np.dot(embedding_a, embedding_b) / (
-                    np.linalg.norm(embedding_a) * np.linalg.norm(embedding_b) + 1e-8
-                )
-            )
-            
-            return max(0.0, min(1.0, similarity))
-        except Exception as e:
-            logger.warning(f"Embedding similarity calculation failed: {e}")
-            return 0.0
+        semantic_similarity = self._semantic_similarity_text(cluster_a.centroid_text or cluster_a.root_cause, cluster_b.centroid_text or cluster_b.root_cause)
+        stacktrace_similarity = self._stacktrace_cluster_similarity(cluster_a, cluster_b)
+        deployment_context = self._deployment_cluster_similarity(cluster_a, cluster_b)
+        temporal_proximity = self._temporal_cluster_similarity(cluster_a, cluster_b)
+        return max(0.0, min(1.0, semantic_similarity * 0.6 + stacktrace_similarity * 0.2 + deployment_context * 0.1 + temporal_proximity * 0.1))
 
-    def _find_historical_matches(
-        self,
-        root_cause: str,
-        signatures: List[str],
-        historical_incidents: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Find similar historical incidents."""
+    def _error_cluster_similarity(self, error: Dict[str, Any], cluster: ErrorCluster) -> float:
+        semantic_similarity = self._semantic_similarity_text(error["_cluster_text"], cluster.centroid_text or cluster.root_cause)
+        stacktrace_similarity = self._stacktrace_similarity(error, cluster)
+        deployment_context = self._deployment_similarity(error, cluster)
+        temporal_proximity = self._temporal_similarity(error, cluster)
+        return max(0.0, min(1.0, semantic_similarity * 0.6 + stacktrace_similarity * 0.2 + deployment_context * 0.1 + temporal_proximity * 0.1))
+
+    def _semantic_similarity_text(self, left: str, right: str) -> float:
+        if not left or not right:
+            return 0.0
+        if self._embedder:
+            try:
+                embeddings = self._embedder.encode([left, right], normalize_embeddings=True)
+                return max(0.0, min(1.0, float(np.dot(embeddings[0], embeddings[1]))))
+            except Exception as exc:
+                logger.debug("Embedding similarity failed: %s", exc)
+        return self._token_similarity(left, right)
+
+    def _stacktrace_cluster_similarity(self, cluster_a: ErrorCluster, cluster_b: ErrorCluster) -> float:
+        fp_a = self._fingerprints.fingerprint_incident({"message": cluster_a.root_cause, "stacktrace": cluster_a.centroid_text, "service": cluster_a.affected_services[:1] or ["unknown"]})
+        fp_b = self._fingerprints.fingerprint_incident({"message": cluster_b.root_cause, "stacktrace": cluster_b.centroid_text, "service": cluster_b.affected_services[:1] or ["unknown"]})
+        comparison = self._fingerprints.compare(fp_a, fp_b)
+        return float(comparison["similarity"])
+
+    def _stacktrace_similarity(self, error: Dict[str, Any], cluster: ErrorCluster) -> float:
+        text = error.get("stack_trace") or error.get("stacktrace") or error.get("message") or ""
+        return self._token_similarity(text, cluster.centroid_text or cluster.root_cause)
+
+    def _deployment_cluster_similarity(self, cluster_a: ErrorCluster, cluster_b: ErrorCluster) -> float:
+        deployments_a = set(cluster_a.deployment_ids)
+        deployments_b = set(cluster_b.deployment_ids)
+        if deployments_a and deployments_b:
+            return len(deployments_a & deployments_b) / len(deployments_a | deployments_b)
+        services_a = set(cluster_a.affected_services)
+        services_b = set(cluster_b.affected_services)
+        if not services_a or not services_b:
+            return 0.0
+        return len(services_a & services_b) / len(services_a | services_b)
+
+    def _deployment_similarity(self, error: Dict[str, Any], cluster: ErrorCluster) -> float:
+        if error.get("deployment_id") and error.get("deployment_id") in cluster.deployment_ids:
+            return 1.0
+        if error.get("service") and error.get("service") in cluster.affected_services:
+            return 0.6
+        changed_files = set(error.get("changed_files") or [])
+        if changed_files and any(changed_files.intersection(set(item.get("changed_files", []) or [])) for item in cluster.representative_evidence):
+            return 0.7
+        return 0.0
+
+    def _temporal_cluster_similarity(self, cluster_a: ErrorCluster, cluster_b: ErrorCluster) -> float:
+        time_a = normalize_timestamp(cluster_a.last_seen)
+        time_b = normalize_timestamp(cluster_b.last_seen)
+        if not time_a or not time_b:
+            return 0.0
+        delta_minutes = abs((time_a - time_b).total_seconds() / 60.0)
+        if delta_minutes <= 30:
+            return 1.0
+        if delta_minutes <= 120:
+            return 0.7
+        if delta_minutes <= 720:
+            return 0.4
+        if delta_minutes <= 1440:
+            return 0.2
+        return 0.0
+
+    def _temporal_similarity(self, error: Dict[str, Any], cluster: ErrorCluster) -> float:
+        error_time = error.get("_timestamp") or normalize_timestamp(error.get("timestamp"))
+        cluster_time = normalize_timestamp(cluster.last_seen)
+        if not error_time or not cluster_time:
+            return 0.0
+        delta_minutes = abs((error_time - cluster_time).total_seconds() / 60.0)
+        if delta_minutes <= 15:
+            return 1.0
+        if delta_minutes <= 60:
+            return 0.7
+        if delta_minutes <= 360:
+            return 0.4
+        return 0.0
+
+    def _find_historical_matches(self, cluster: ErrorCluster, historical_incidents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         matches = []
-        
+        cluster_signature = normalize_text(cluster.signature or cluster.root_cause)
         for incident in historical_incidents:
-            # Check signature overlap
-            hist_sigs = set(incident.get("signatures", []))
-            current_sigs = set(signatures)
-            sig_overlap = bool(hist_sigs & current_sigs)
-            
-            if sig_overlap:
+            historical_signature = normalize_text(incident.get("signature") or incident.get("root_cause") or incident.get("summary") or "")
+            service_overlap = set(cluster.affected_services) & set(incident.get("affected_services", []) or incident.get("services", []) or [])
+            incident_deployment_ids = []
+            if incident.get("deployment_id"):
+                incident_deployment_ids.append(incident["deployment_id"])
+            incident_deployment_ids.extend(incident.get("deployment_ids", []) or [])
+            deployment_overlap = set(cluster.deployment_ids) & set(incident_deployment_ids)
+            if service_overlap or deployment_overlap or self._token_similarity(cluster_signature, historical_signature) >= 0.45:
                 matches.append(incident)
-        
         return matches
 
-    def _calculate_frequency_trend(self, errors: List[Dict[str, Any]]) -> str:
-        """Analyze if errors are increasing, stable, or decreasing."""
-        if len(errors) < 2:
-            return "stable"
-        
-        # Sort by timestamp
-        errors_sorted = sorted(
-            errors,
-            key=lambda e: e.get("timestamp", ""),
-        )
-        
-        # Split into recent vs older
-        midpoint = len(errors_sorted) // 2
-        older = errors_sorted[:midpoint]
-        recent = errors_sorted[midpoint:]
-        
-        older_count = len(older)
-        recent_count = len(recent)
-        
-        if recent_count > older_count * 1.5:
-            return "increasing"
-        elif recent_count < older_count * 0.67:
-            return "decreasing"
-        else:
-            return "stable"
+    def _cluster_evidence(self, error: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "signature": error.get("signature"),
+            "message": error.get("message"),
+            "stack_trace": error.get("stack_trace") or error.get("stacktrace"),
+            "deployment_id": error.get("deployment_id"),
+            "commit_sha": error.get("commit_sha"),
+            "changed_files": error.get("changed_files", []),
+            "timestamp": error.get("timestamp"),
+        }
 
-    def _infer_severity(
-        self,
-        errors: List[Dict[str, Any]],
-        services: List[str],
-    ) -> str:
-        """Infer severity level from error characteristics."""
-        error_count = len(errors)
-        
-        # Critical: Many errors in many services
-        if error_count >= 50 and len(services) >= 3:
-            return "S1"
-        # High: Many errors in core services
-        elif error_count >= 20 and len(services) >= 2:
-            return "S2"
-        # Medium: Moderate errors or affecting important service
-        elif error_count >= 5:
-            return "S3"
-        # Low: Few errors
-        else:
-            return "S4"
-
-    def _estimate_regression_probability(self, errors: List[Dict[str, Any]]) -> float:
-        """Estimate likelihood this is a regression."""
-        # Simple heuristic: frequent, recent errors = higher regression chance
-        error_count = len(errors)
-        
-        # Base probability
-        prob = 0.3 if error_count >= 10 else 0.1
-        
-        # Check if recent
-        recent_errors = [
-            e for e in errors
-            if (datetime.now(timezone.utc) - datetime.fromisoformat(
-                e.get("timestamp", datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00")
-            )).total_seconds() < 300  # Last 5 minutes
-        ]
-        
-        if len(recent_errors) / max(error_count, 1) > 0.5:
-            prob += 0.3
-        
-        return min(1.0, prob)
+    def _cluster_to_payload(self, cluster: ErrorCluster) -> Dict[str, Any]:
+        commit_shas = [item.get("commit_sha") for item in cluster.representative_evidence if item.get("commit_sha")]
+        changed_files = [file for item in cluster.representative_evidence for file in item.get("changed_files", [])] if cluster.representative_evidence else []
+        return {
+            "cluster_id": cluster.cluster_id,
+            "signature": cluster.signature or (cluster.error_signatures[0] if cluster.error_signatures else cluster.root_cause),
+            "root_cause": cluster.root_cause,
+            "affected_services": cluster.affected_services,
+            "affected_orgs": cluster.affected_orgs,
+            "error_count": cluster.error_count,
+            "deployment_ids": cluster.deployment_ids,
+            "commit_shas": commit_shas,
+            "changed_files": changed_files,
+            "topology_affected": cluster.topology_affected,
+            "last_seen": cluster.last_seen,
+            "confidence": cluster.confidence,
+            "regression_probability": cluster.regression_probability,
+            "historical_recurrence": cluster.historical_recurrence,
+            "errors": cluster.representative_evidence,
+        }
 
     def _generate_preliminary_root_cause(self, errors: List[Dict[str, Any]]) -> str:
-        """Generate initial root cause hypothesis."""
-        # Extract common patterns
-        exception_types = {}
+        exception_types = defaultdict(int)
+        services = []
         for error in errors:
-            exc = error.get("exception_type", "Unknown")
-            exception_types[exc] = exception_types.get(exc, 0) + 1
-        
-        most_common_exc = max(exception_types.items(), key=lambda x: x[1])[0]
-        
-        services = list(set(e.get("service", "unknown") for e in errors))
-        service_str = ", ".join(services[:3])
-        
-        return f"Multiple {most_common_exc} errors in {service_str}"
+            exception_types[error.get("exception_type", "Unknown")] += 1
+            if error.get("service"):
+                services.append(error["service"])
+        most_common_exc = max(exception_types.items(), key=lambda item: item[1])[0]
+        service_str = ", ".join(list(dict.fromkeys(services))[:3]) or "unknown service"
+        return f"{most_common_exc} failures in {service_str}"
 
-    def _analyze_topology(self, services: List[str]) -> List[str]:
-        """Analyze service topology impact."""
-        # This is simplified; in production would call topology_propagation module
-        return services
+    def _error_services(self, error: Dict[str, Any]) -> List[str]:
+        services = []
+        if error.get("service"):
+            services.append(str(error["service"]))
+        for path in error.get("service_paths", []) or []:
+            if isinstance(path, list):
+                services.extend(str(step) for step in path if step)
+            elif path:
+                services.append(str(path))
+        return list(dict.fromkeys([service for service in services if service and service != "unknown"]))
+
+    def _infer_severity(self, errors: List[Dict[str, Any]], services: List[str]) -> str:
+        error_count = len(errors)
+        if error_count >= 50 and len(services) >= 3:
+            return "S1"
+        if error_count >= 20 and len(services) >= 2:
+            return "S2"
+        if error_count >= 5:
+            return "S3"
+        return "S4"
+
+    def _estimate_regression_probability(self, errors: List[Dict[str, Any]]) -> float:
+        error_count = len(errors)
+        probability = 0.3 if error_count >= 10 else 0.1
+        recent_errors = [error for error in errors if error.get("_timestamp") and (datetime.now(timezone.utc) - error["_timestamp"]).total_seconds() < 300]
+        if len(recent_errors) / max(error_count, 1) > 0.5:
+            probability += 0.3
+        return min(1.0, probability)
 
     def _compute_evidence_score(self, errors: List[Dict[str, Any]]) -> float:
-        """Compute overall evidence quality score."""
         score = 0.0
-        
-        # Factor 1: Error count
         error_count = len(errors)
-        count_score = min(1.0, error_count / 50.0)
-        score += count_score * 0.3
-        
-        # Factor 2: Stack trace quality (errors have detailed traces)
-        with_traces = sum(1 for e in errors if e.get("stack_trace"))
-        trace_score = len(with_traces) / max(error_count, 1)
-        score += trace_score * 0.3
-        
-        # Factor 3: Metadata completeness
-        with_metadata = sum(1 for e in errors if e.get("metadata"))
-        metadata_score = with_metadata / max(error_count, 1)
-        score += metadata_score * 0.2
-        
-        # Factor 4: Service consistency (errors in same service = higher confidence)
-        services = set(e.get("service", "") for e in errors)
-        service_score = 1.0 if len(services) == 1 else 0.5
-        score += service_score * 0.2
-        
+        score += min(1.0, error_count / 50.0) * 0.3
+        with_traces = sum(1 for error in errors if error.get("stack_trace") or error.get("stacktrace"))
+        score += (with_traces / max(error_count, 1)) * 0.3
+        with_metadata = sum(1 for error in errors if error.get("metadata"))
+        score += (with_metadata / max(error_count, 1)) * 0.2
+        services = set(error.get("service", "") for error in errors)
+        score += (1.0 if len(services) == 1 else 0.5) * 0.2
         return min(1.0, score)
 
-    def _merge_severities(self, sev_a: str, sev_b: str) -> str:
-        """Merge two severity levels into the higher one."""
+    def _confidence_from_error(self, error: Dict[str, Any]) -> float:
+        confidence = 0.45
+        if error.get("stack_trace") or error.get("stacktrace"):
+            confidence += 0.2
+        if error.get("deployment_id"):
+            confidence += 0.15
+        if error.get("commit_sha") or error.get("changed_files"):
+            confidence += 0.15
+        if error.get("signal_type"):
+            confidence += 0.05
+        return min(1.0, confidence)
+
+    def _merge_severities(self, severity_a: str, severity_b: str) -> str:
         severity_rank = {"S1": 1, "S2": 2, "S3": 3, "S4": 4}
-        rank_a = severity_rank.get(sev_a, 4)
-        rank_b = severity_rank.get(sev_b, 4)
-        return sev_a if rank_a <= rank_b else sev_b
+        return severity_a if severity_rank.get(severity_a, 4) <= severity_rank.get(severity_b, 4) else severity_b
 
     def _severity_rank(self, severity: str) -> int:
-        """Convert severity to sortable rank."""
         return {"S1": 1, "S2": 2, "S3": 3, "S4": 4}.get(severity, 4)
+
+    def _map_operational_severity(self, operational_severity: str) -> str:
+        return {
+            "outage-risk": "S1",
+            "critical": "S2",
+            "degraded": "S3",
+            "informational": "S4",
+        }.get(operational_severity, "S4")
+
+    def _signal_type(self, error: Dict[str, Any]) -> str:
+        message = normalize_text(" ".join(str(part) for part in [error.get("signature"), error.get("message"), error.get("stack_trace"), error.get("stacktrace")] if part))
+        if any(token in message for token in ("deploy", "rollout", "release")):
+            return "deployment_failed"
+        if any(token in message for token in ("build", "compile", "ci")):
+            return "build_failed"
+        if any(token in message for token in ("timeout", "deadline exceeded")):
+            return "workflow_timeout"
+        if any(token in message for token in ("rollback",)):
+            return "rollback_detected"
+        if any(token in message for token in ("hotfix",)):
+            return "hotfix_detected"
+        if any(token in message for token in ("dependency", "package", "lockfile")):
+            return "dependency_break"
+        return "runtime_error"
+
+    def _token_similarity(self, left: str, right: str) -> float:
+        left_tokens = set(normalize_text(left).split())
+        right_tokens = set(normalize_text(right).split())
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+__all__ = ["RootCauseClusterer", "ErrorCluster"]
